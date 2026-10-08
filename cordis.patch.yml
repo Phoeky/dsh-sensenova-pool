@@ -1,0 +1,6 @@
+# Register the SenseNova key-pool provider without changing the profile's
+# current default model. Keys are entered through the plugin's own settings
+# card / web route; nothing secret is written into this file.
+- insert:
+    - id: llm-sensenova-pool
+      name: dsh-sensenova-pool
