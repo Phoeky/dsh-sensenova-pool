@@ -8,3 +8,6 @@ lib/
 
 # 临时文件
 *.log
+
+# npm 生成的 lock（本项目使用 pnpm-lock.yaml）
+package-lock.json
