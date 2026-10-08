@@ -2,7 +2,7 @@
   "name": "dsh-sensenova-pool",
   "displayName": "DSH SenseNova Key Pool",
   "description": "商汤日日新（SenseNova）多 Key 轮换池 — 填入多把 Key 即可零配置接入 DeepSeek Harness，遇 429 限流自动切换下一把 Key。",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "Phoeky",
   "keywords": [
     "dsh-plugin",
