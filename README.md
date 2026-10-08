@@ -22,7 +22,7 @@
 
 填入任意多把商汤 Key，请求在多把 Key 之间自动轮转，把每把 Key 的额度摊开使用。
 
-![Key 管理卡片](docs/shots/01-keys.png)
+![Key 管理卡片](https://raw.githubusercontent.com/Phoeky/dsh-sensenova-pool/main/docs/shots/01-keys.png)
 
 - **一次粘贴多把**：换行、逗号、分号、空格分隔都可以
 - **自动清洗**：识别并去除 `Bearer ` 前缀、首尾引号、重复项、明显无效的短串
@@ -112,7 +112,7 @@ pnpm --dir "$DSH_PROFILE_DIR" add "link:$PWD"
 
 改完 `package.json` 后**重启 DeepSeek Harness**。确认安装成功：插件页的「已安装」列表里会出现本插件。
 
-![插件页](docs/shots/02-installed.png)
+![插件页](https://raw.githubusercontent.com/Phoeky/dsh-sensenova-pool/main/docs/shots/02-installed.png)
 
 ---
 
