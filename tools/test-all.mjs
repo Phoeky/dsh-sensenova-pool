@@ -19,6 +19,7 @@ const SUITES = [
   { name: 'key 轮换池逻辑', file: 'test-rotate.mjs', args: [] },
   { name: '回环 shim 协议', file: 'test-shim.mjs', args: [] },
   { name: 'apply() 启动时序', file: 'test-apply.mjs', args: ['--import', './tools/stub-loader.mjs'] },
+  { name: '凭据记录 schema', file: 'test-credentials-record.mjs', args: ['--import', './tools/stub-loader.mjs'] },
   { name: 'Web 路由与令牌', file: 'test-routes.mjs', args: [] },
   { name: '浏览器半契约', file: 'test-client.mjs', args: [] },
 ];

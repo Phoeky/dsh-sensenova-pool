@@ -88,7 +88,7 @@ const { ctx, state } = makeCtx();
 // 提供凭据服务，让插件能装载 key（模拟 DSH 的 credentials 记录）。
 state.services.credentials = {
   async readRecord(id) {
-    return { kind: 'api-key', payload: { keys } };
+    return { kind: 'grant', payload: { keys } };
   },
   async modifyRecord() {},
 };

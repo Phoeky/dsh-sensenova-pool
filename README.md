@@ -179,6 +179,28 @@ sk-cccccccccccccccccccccccccccccc
 
 在卡片上点某把 Key 的「测试」看真实原因。`403 model is not available in the current token plan` 表示该模型不在这个 Key 的套餐里 —— 换模型，而不是换 Key。
 
+**DSH 弹「The application could not start or stopped unexpectedly」，完全起不来？**
+
+先看崩溃日志里的失败插件名。如果 `Failed plugins` 指向 `credentials`，且错误是
+`record "dsh-sensenova-pool/keys" ... has unknown field "payload"`，说明凭据库里那条记录
+的标签写错了 —— DSH 的凭据库对记录做白名单校验，`api-key` 只认 `kind`/`key`/`env`，
+`grant` 只认 `kind`/`payload`，**一条记录不合规就会让 `credentials` 插件激活失败，进而
+中止整个应用启动**（0.1.1 及更早版本存在这个写入 bug，已修复）。
+
+手工修复：编辑 `$DSH_HOME/.credentials.yaml`，把该记录的 `kind: api-key` 改成
+`kind: grant`（`payload.keys` 里的 Key 原样保留），然后重启 DSH。
+
+```yaml
+records:
+  dsh-sensenova-pool/keys:
+    kind: grant          # ← 必须是 grant；api-key 不接受 payload
+    payload:
+      keys:
+        - sk-…
+```
+
+崩溃日志位置：Windows 下为 `%APPDATA%\@deepseek-ai\dsh-desktop\logs\crash-*-host.log`。
+
 **Key 会泄漏吗？**
 
 不会。界面只显示掩码；明文只存在 DSH 凭据库（`$DSH_HOME/.credentials.yaml`）中，不会写入任何配置文件，也不会出现在日志里。

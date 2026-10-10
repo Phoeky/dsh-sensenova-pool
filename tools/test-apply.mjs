@@ -121,7 +121,7 @@ console.log('\n[apply] 凭据服务可用时能从记录里装载 key');
   state.services.credentials = {
     async readRecord(id) {
       check('读取的记录 id 正确', id === 'dsh-sensenova-pool/keys', id);
-      return { kind: 'api-key', payload: { keys: stored } };
+      return { kind: 'grant', payload: { keys: stored } };
     },
     async modifyRecord() {},
   };

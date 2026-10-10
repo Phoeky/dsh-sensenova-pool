@@ -222,8 +222,22 @@ export function apply(ctx: any, config: PluginConfig): void {
     const credentials = credentialsService();
     if (credentials === undefined) throw new Error('凭据服务不可用，无法保存 key');
     const keys = pool.keys();
+    // 必须用 `grant`，不能用 `api-key`。
+    //
+    // credentials-local 对记录做白名单校验（`assertFields`），两种标签允许的字段
+    // 是互斥的：`api-key` 只认 `kind` / `key` / `env`，`grant` 只认 `kind` /
+    // `payload`。而 `api-key` 的 `key` 是**单值**字符串，根本表达不了 key 池，
+    // 所以池子只能落在 `grant` 的 `payload` 里（存储对 grant payload 逐字保留，
+    // 不做解释）。
+    //
+    // 踩过的坑：这里原先写的是 `kind: 'api-key'` + `payload`。写入路径的
+    // `assertStorableApiKey` 只校验 `key` 是否为空和 `env` 值，**不查未知字段**，
+    // 于是坏记录顺利落盘；下次启动时 credentials-local 在 loadInitial 阶段
+    // 解析失败 → credentials 插件激活失败 → 整个 dsh 启动中止（弹「could not
+    // start or stopped unexpectedly」）。一条记录写错就能锁死整个应用，所以这里
+    // 的标签必须与 schema 严格对齐。
     await credentials.modifyRecord(RECORD_ID, async () => ({
-      kind: 'api-key',
+      kind: 'grant',
       payload: { keys },
     }));
   }
