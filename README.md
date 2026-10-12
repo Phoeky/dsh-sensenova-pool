@@ -201,6 +201,15 @@ records:
 
 崩溃日志位置：Windows 下为 `%APPDATA%\@deepseek-ai\dsh-desktop\logs\crash-*-host.log`。
 
+**重启电脑后 Key 池空了（「忘记 Key」）？**
+
+0.1.2 及更早版本存在一个**启动竞态**：插件启动时只读一次凭据库，而 DSH 的凭据快照
+是异步读盘填充的，冷启动磁盘慢时就会读到空快照，于是池子变成 0 把 —— 且此后没有任何
+补载机制，只能重新填 Key。**0.1.3 已修复**（改为等凭据服务真正就绪后再装载）。
+
+如果你还在旧版本上遇到，升级即可，不需要重新填 Key（Key 一直好好地在
+`$DSH_HOME/.credentials.yaml` 里）。临时办法是在插件卡片上点一次「刷新/重载」。
+
 **Key 会泄漏吗？**
 
 不会。界面只显示掩码；明文只存在 DSH 凭据库（`$DSH_HOME/.credentials.yaml`）中，不会写入任何配置文件，也不会出现在日志里。
@@ -256,6 +265,14 @@ Add `"dsh-sensenova-pool"` to `dsh.profile.bundles` in your profile `package.jso
 ### Usage
 
 Open **Plugins → dsh-sensenova-pool**, paste your keys, click **Add keys**, then pick any model under the "商汤日日新（Key 轮换池）" group in the model picker.
+
+### Troubleshooting
+
+**The key pool is empty after rebooting the machine ("it forgot my keys")?**
+
+Versions 0.1.2 and earlier had a startup race: the plugin read the credential store once at startup, while DSH fills that store from disk asynchronously. On a slow cold boot the plugin read an empty snapshot, so the pool came up with zero keys — and nothing ever re-loaded it, forcing you to re-enter them. **Fixed in 0.1.3** (the plugin now waits until the credentials service is genuinely ready before loading).
+
+Upgrade and your keys will be picked up again; they were never lost (they live in `$DSH_HOME/.credentials.yaml`). On an older version, clicking reload on the plugin card recovers them for the session.
 
 ### Acknowledgements
 

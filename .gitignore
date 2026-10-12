@@ -6,6 +6,9 @@ lib/
 # 仅用于开发时对照平台契约，不属于插件产物，体积较大。
 .ref/
 
+# e2e 用的真实凭据链依赖（由 tools/e2e-extract-deps.mjs 从 app.asar 提取）
+_e2e/
+
 # 临时文件
 *.log
 

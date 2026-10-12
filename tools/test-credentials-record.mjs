@@ -101,6 +101,28 @@ state.services.webServer = {
 };
 
 // ---- 真实调用 apply() ------------------------------------------------------
+
+/**
+ * 拦住对外网的 fetch，但放行回环（测试自己要用 127.0.0.1 起 HTTP 服务）。
+ *
+ * 为什么必须拦：填完 key 后 `onKeysChanged` 会 `void fetchCatalogFromUpstream()`，
+ * 对真实的 `https://token.sensenova.cn/v1/models` 发一次请求。测试不该依赖网络，
+ * 而且进程在这条请求还停在 DNS/TLS 阶段就 `process.exit()` 时，Windows 上会撞上
+ * libuv 断言：
+ *   Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), src\win\async.c, line 94
+ * 表现为退出码 0xC0000409 —— 断言全过，套件却被判失败。这里让上游不可达，插件走
+ * 「目录刷新失败但不影响可用性」的分支，正是我们要的确定性行为。
+ */
+const realFetch = globalThis.fetch;
+globalThis.fetch = async (input, init) => {
+  const url = typeof input === 'string' ? input : input?.url ?? String(input);
+  const { hostname } = new URL(url);
+  if (hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1') {
+    return realFetch(input, init);
+  }
+  throw new Error(`offline: outbound fetch to ${hostname} is stubbed in this test`);
+};
+
 const { apply } = await import('../lib/index.js');
 apply(ctx, {});
 await new Promise((r) => setTimeout(r, 400));
@@ -152,8 +174,37 @@ check('校验桩能识破 api-key + payload 的坏形状', rejectsBadShape);
 
 check('落盘过程没有 warn 日志', !warnings.some((m) => m.includes('keys route')), JSON.stringify(warnings));
 
+// 关掉测试自己的 HTTP 服务。
+//
+// `server.close()` 只是停止接受新连接，**不会**关闭已经空闲的 keep-alive 连接：
+// undici（globalThis.fetch 的实现）默认复用连接，所以这里必须显式 closeAllConnections，
+// 否则那些 Socket 会活到进程退出，Windows 上撞上 libuv 断言：
+//   Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), src\win\async.c, line 94
+// 表现为退出码 0xC0000409 —— 断言全过，套件却被判失败。
+server.closeAllConnections();
 await new Promise((r) => server.close(r));
-await state.effects[0]?.();
+
+// 释放**全部** effect，而不只是第一条：启动块注册的那条 effect 负责关闭回环 shim
+// （`shim.close()`），它排在 routes 的三条之后（因为它在 `await shim.ready` 之后才
+// 注册）。只释放 effects[0] 会把仍在监听的 shim 留在事件循环上。
+for (const dispose of state.effects) {
+  try {
+    await dispose?.();
+  } catch {
+    // 释放失败不影响断言结论。
+  }
+}
+
+// 归还全局 fetch，避免影响同进程内的其他测试。
+globalThis.fetch = realFetch;
 
 console.log(`\n=== ${pass} passed, ${fail} failed ===\n`);
-process.exit(fail === 0 ? 0 : 1);
+// 用 exitCode 让事件循环自然排空，而不是 `process.exit()` 硬切。
+//
+// 为什么：本套件同时持有多条 keep-alive 的 undici Socket（测试自己 fetch 回环服务）
+// 与两个 Server（测试的、插件的 shim）。`process.exit()` 在某个 Socket 正处于
+// closing 状态时切进程，Windows 上会撞上 libuv 断言：
+//   Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), src\win\async.c, line 94
+// 表现为退出码 0xC0000409 —— 断言全过，套件却被判失败。设置 exitCode 后让循环自然
+// 结束，这些句柄会先正常关闭；`test-all.mjs` 通过 spawnSync 读到的仍是这个退出码。
+process.exitCode = fail === 0 ? 0 : 1;

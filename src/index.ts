@@ -192,8 +192,73 @@ export function apply(ctx: any, config: PluginConfig): void {
   const RECORD_SCOPE = 'dsh-sensenova-pool';
   const RECORD_ID = `${RECORD_SCOPE}/keys`;
 
+  /**
+   * 写入前等待首次权威装载的上限（毫秒）。
+   *
+   * 只作为兜底：正常路径下 `firstAuthoritativeLoad` 会在凭据服务就绪的那一刻兑现。
+   * 设上限是为了「宿主没有凭据服务」时不要永远挂住写入请求。
+   */
+  const SAVE_LOAD_WAIT_MS = 10_000;
+
+  /** 严格读取：只返回**已就绪**（fiber ACTIVE）的凭据服务。 */
   function credentialsService(): any {
     return ctx.get?.('credentials');
+  }
+
+  /**
+   * 宽松读取：服务**已注册但可能仍在加载**时也能拿到实例。
+   *
+   * 用来区分两种「读不到凭据」：服务正在加载（应继续等），还是宿主压根没有这个
+   * 服务（应直接提示用户填 key）。
+   */
+  function credentialsRegistered(): boolean {
+    try {
+      return ctx.get?.('credentials', false) !== undefined;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 「首次**权威**装载」完成信号。
+   *
+   * 权威 = 凭据服务**真正就绪**（fiber 已 ACTIVE、`.credentials.yaml` 已解析进内存
+   * 快照），而不是「服务对象已构造」。这两者的区别正是 issue #1：
+   *
+   *   1. **已构造** —— `Service` 在构造函数里就 `provide()`，服务已能被解析到，但
+   *      所属 fiber 还停在 PENDING/LOADING，`Service.init` 尚未跑完；
+   *   2. **已就绪** —— `Service.init` 已结束，credentials-local 的 `loadInitial()`
+   *      已把 `.credentials.yaml` 填进内存快照。
+   *
+   * 本插件只 `inject: ['llm']`，与 credentials 之间**没有顺序保证**。冷启动磁盘 IO
+   * 慢时 `loadKeys()` 会先于 `loadInitial()` 执行，`readRecord()` 读到空快照 → key
+   * 池为 0，且此后没有任何补载机制（`credentials/record-updated` 只在运行期写入时
+   * 触发，覆盖不到启动装载）—— 这就是「重启电脑后 Key 池为空」。
+   *
+   * 修复方式不是「轮询 + 超时」，而是用 cordis 自己的就绪通知：`ctx.inject` 的回调
+   * **只在服务所属 fiber 变为 ACTIVE 时才触发**（已用真实 cordis 验证）。它精确、
+   * 零延迟，也不会给「宿主根本没有凭据服务」的环境白等一段超时 —— 那种情况下回调
+   * 只是不触发，启动路径照常给出「请填入 key」的提示。
+   *
+   * 之所以要等它再允许写入：`saveKeys()` 是用 `pool.keys()` **整体覆盖**记录。若在
+   * 权威装载之前写入（启动还没完，用户就点了「添加 Key」），池子里只有刚加的那把，
+   * 磁盘上原有的 key 会被静默抹掉。
+   */
+  let notifyKeysLoaded: (() => void) | undefined;
+  const firstAuthoritativeLoad = new Promise<void>((resolve) => {
+    notifyKeysLoaded = resolve;
+  });
+
+  /**
+   * 装载 key，并在**凭据快照确实可读**时宣告首次权威装载完成。
+   *
+   * 只有凭据服务可见时才宣告：否则「池子为空」只代表「还没读到」，不代表「真的没有
+   * key」，提前宣告会让 `saveKeys()` 把空池覆盖写回记录。
+   */
+  async function loadKeysAndNotify(): Promise<number> {
+    const added = await loadKeys();
+    if (credentialsService() !== undefined) notifyKeysLoaded?.();
+    return added;
   }
 
   async function loadKeys(): Promise<number> {
@@ -218,7 +283,28 @@ export function apply(ctx: any, config: PluginConfig): void {
     return added;
   }
 
+  /**
+   * 可被进程退出的定时器（`unref`）。
+   *
+   * 为什么不用裸 `setTimeout`：这里只拿它当「兜底超时」，正常路径下由 Promise 先行
+   * 兑现。裸定时器会一直挂在事件循环上，让 DSH 退出时多等一段、也让测试无谓变慢。
+   */
+  function delay(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, ms);
+      (timer as any)?.unref?.();
+    });
+  }
+
   async function saveKeys(): Promise<void> {
+    // 写入前必须确保首次**权威**装载已完成：saveKeys 是整体覆盖写，若此时池子还是
+    // 空的（快照尚未读到），磁盘上原有的 key 会被这次写入静默抹掉。
+    //
+    // 只在凭据服务**确实存在**时才等：宿主压根没有该服务时，等它没有意义，直接让
+    // 下面给出明确错误，而不是让用户对着转圈的按钮等满超时。
+    if (credentialsRegistered()) {
+      await Promise.race([firstAuthoritativeLoad, delay(SAVE_LOAD_WAIT_MS)]);
+    }
     const credentials = credentialsService();
     if (credentials === undefined) throw new Error('凭据服务不可用，无法保存 key');
     const keys = pool.keys();
@@ -354,6 +440,8 @@ export function apply(ctx: any, config: PluginConfig): void {
       await shim.ready;
     } catch (error) {
       logger.error(`回环端点启动失败：${error instanceof Error ? error.message : String(error)}`);
+      // 监听失败时 server 可能已部分启动；显式关闭，避免留下半开的句柄。
+      await shim.close().catch(() => {});
       return;
     }
 
@@ -362,27 +450,93 @@ export function apply(ctx: any, config: PluginConfig): void {
       adapter = createAdapter();
       registration = ctx.llm.registerAdapter([PROVIDER_ID], adapter);
       ctx.effect?.(() => () => {
+        // 必须**返回** close() 的 Promise：cordis 的 disposer 可以是异步的，返回它
+        // 才会等回环服务真正关闭。原先写成 `void shim.close()`，卸载时 Promise 无人
+        // 等待，server 仍在监听的状态下进程就可能退出 —— 在 Windows 上表现为 libuv
+        // 断言（async.c: !(handle->flags & UV_HANDLE_CLOSING)），退出码 0xC0000409。
         try {
           registration?.();
         } finally {
-          void shim.close();
+          return shim.close();
         }
       });
       logger.info(`已注册 provider "${PROVIDER_ID}"，模型分组「${PROVIDER_NAME}」`);
     } catch (error) {
       logger.error(`注册 provider 失败：${error instanceof Error ? error.message : String(error)}`);
-      void shim.close();
+      await shim.close();
       return;
     }
 
-    const loaded = await loadKeys();
-    if (loaded > 0) {
-      refreshCatalog();
-      void fetchCatalogFromUpstream();
-    } else {
+    // ---- 装载 key（issue #1：等凭据快照真正就绪） --------------------------
+    //
+    // 这里不再「立刻读一次就算」，而是等凭据服务就绪的通知：`ctx.inject` 的回调
+    // 只在 credentials 所属 fiber 变为 ACTIVE（`loadInitial()` 已填充快照）时触发。
+    // 冷启动磁盘 IO 慢时，正是这一等把「读到空快照」变成了「读到真实的 key 列表」。
+    //
+    // 回调可能因服务重注册而多次触发；`pool.addKey()` 幂等，重复装载安全。
+    const onCredentialsReady = (): void => {
+      void loadKeysAndNotify()
+        .then((added) => {
+          if (added > 0) {
+            refreshCatalog();
+            void fetchCatalogFromUpstream();
+          } else {
+            logger.info('key 池为空 —— 请在「设置 → 插件 → 商汤日日新（Key 轮换池）」里填入 key');
+          }
+        })
+        .catch((error: unknown) => {
+          logger.warn(`装载 key 失败：${error instanceof Error ? error.message : String(error)}`);
+        });
+    };
+
+    if (typeof ctx.inject === 'function') {
+      try {
+        ctx.inject(['credentials'], onCredentialsReady);
+      } catch (error) {
+        // 注入注册失败（例如 ctx 形状不符）：退化为「服务已就绪就直接装载一次」，
+        // 至少不比旧行为更差。
+        logger.warn(`等待凭据服务就绪失败，改为立即尝试装载：${error instanceof Error ? error.message : String(error)}`);
+        if (credentialsService() !== undefined) onCredentialsReady();
+      }
+    } else if (credentialsService() !== undefined) {
+      // 极老的宿主没有 ctx.inject：退化为直接装载一次（此时服务已就绪）。
+      onCredentialsReady();
+    }
+
+    // 宿主没有凭据服务时，上面的回调永不触发 —— 仍需给出可操作的提示（与旧行为一致）。
+    // 但如果服务**已注册、只是在加载**（冷启动的竞态场景），就绝不能在这里报
+    // 「池为空」：那是还没读到，不是真的没有 key。此时静默等待即可。
+    await delay(0);
+    if (credentialsService() === undefined && !credentialsRegistered()) {
       logger.info('key 池为空 —— 请在「设置 → 插件 → 商汤日日新（Key 轮换池）」里填入 key');
     }
   })();
+
+  /**
+   * 兜底补载：凭据记录被**本进程之外**改动时（手工编辑 `.credentials.yaml`、
+   * 另一次 boot 迁移了文档布局），credentials-local 的 watcher 会 emit
+   * `credentials/record-updated`。这里据此重载，使池子最终一致。
+   *
+   * 注意这不是启动竞态的修复手段 —— 那条路径由 `ctx.inject(['credentials'])` 负责，
+   * 因为启动装载**早于**任何事件发生，等事件是等不到的。这里只覆盖运行期变更。
+   */
+  try {
+    ctx.on?.('credentials/record-updated', (key: unknown) => {
+      if (key !== RECORD_ID) return;
+      void loadKeysAndNotify()
+        .then((added) => {
+          if (added > 0) {
+            refreshCatalog();
+            void fetchCatalogFromUpstream();
+          }
+        })
+        .catch((error: unknown) => {
+          logger.warn(`记录变更后重载失败：${error instanceof Error ? error.message : String(error)}`);
+        });
+    });
+  } catch {
+    // 事件总线形状不符：不影响主路径。
+  }
 
   /**
    * 用池里的 key 拉取真实模型目录。
@@ -465,7 +619,9 @@ export function apply(ctx: any, config: PluginConfig): void {
         void fetchCatalogFromUpstream();
       },
       reload: async () => {
-        await loadKeys();
+        // 手动重载：走同一套「装载并宣告」逻辑，因此在启动早期点它也不会把
+        // 「还没读到」误当成「真的没有 key」而清空权威装载信号。
+        await loadKeysAndNotify();
         refreshCatalog();
       },
       fetchCatalog: fetchCatalogFromUpstream,
