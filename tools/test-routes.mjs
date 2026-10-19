@@ -28,12 +28,19 @@ const ctx = {
 };
 
 const pool = new KeyPool([], {});
+const modelRows = [
+  { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', contextWindow: 1048576, maxTokens: 65536, enabled: true },
+  { id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1048576, maxTokens: 131072, enabled: true },
+];
+const modelsChanged = [];
 registerKeyRoutes(ctx, {
   status: {
     pool: () => pool.snapshot(),
     summary: () => pool.summary(),
     catalog: () => ({ source: 'builtin', count: 7, fetchedAt: 0, error: '' }),
     rotations: () => [],
+    endpoint: () => ({ baseUrl: 'http://127.0.0.1:54321/v1', port: 54321, apiKey: 'sk-dsh-test-external-key' }),
+    models: () => modelRows.map((row) => ({ ...row })),
     providerId: 'sensenova-pool',
     providerName: '商汤日日新（Key 轮换池）',
     baseUrl: 'https://token.sensenova.cn/v1',
@@ -41,6 +48,10 @@ registerKeyRoutes(ctx, {
   pool,
   logger: { info() {}, warn() {}, error() {} },
   onKeysChanged: async () => { saved.push(pool.keys()); },
+  onModelsChanged: async (disabled) => {
+    modelsChanged.push(disabled);
+    for (const row of modelRows) row.enabled = !disabled.includes(row.id);
+  },
   reload: async () => {},
   fetchCatalog: async () => {},
 });
@@ -81,6 +92,16 @@ let adminKey;
   check('下发写入令牌', typeof r.body.adminKey === 'string' && r.body.adminKey.length > 20);
   check('状态里带 keys 数组', Array.isArray(r.body.keys));
   adminKey = r.body.adminKey;
+}
+
+console.log('\n[route] 对外接口信息');
+{
+  const r = await get('/plugins/dsh-sensenova-pool/status');
+  check('返回接口地址', r.body.endpoint?.baseUrl === 'http://127.0.0.1:54321/v1', JSON.stringify(r.body.endpoint));
+  check('返回端口', r.body.endpoint?.port === 54321, String(r.body.endpoint?.port));
+  check('返回对外 API Key', r.body.endpoint?.apiKey === 'sk-dsh-test-external-key', JSON.stringify(r.body.endpoint));
+  check('返回模型列表（含可见性）', Array.isArray(r.body.models) && r.body.models.length === 2, JSON.stringify(r.body.models));
+  check('模型带 enabled 标记', r.body.models.every((m) => typeof m.enabled === 'boolean'));
 }
 
 console.log('\n[route] 写入令牌守卫（回环 ≠ 认证）');
@@ -152,6 +173,27 @@ console.log('\n[route] 删除与清空');
   const clear = await post('/plugins/dsh-sensenova-pool/keys', { action: 'clear' }, { 'x-sensenova-pool-admin': adminKey });
   check('清空成功', clear.body.cleared === true);
   check('池为空', pool.size === 0);
+}
+
+console.log('\n[route] 模型可见性');
+{
+  const noToken = await post('/plugins/dsh-sensenova-pool/keys', { action: 'set-model', id: 'glm-5.2', enabled: false });
+  check('无令牌切换模型被拒 403', noToken.status === 403, String(noToken.status));
+
+  const hide = await post('/plugins/dsh-sensenova-pool/keys', { action: 'set-model', id: 'glm-5.2', enabled: false }, { 'x-sensenova-pool-admin': adminKey });
+  check('隐藏模型 200', hide.status === 200, JSON.stringify(hide.body));
+  check('回调收到「被隐藏」列表', modelsChanged.at(-1)?.join(',') === 'glm-5.2', JSON.stringify(modelsChanged.at(-1)));
+  check('响应里 glm-5.2 已隐藏', hide.body.models.find((m) => m.id === 'glm-5.2')?.enabled === false);
+
+  const show = await post('/plugins/dsh-sensenova-pool/keys', { action: 'set-model', id: 'glm-5.2', enabled: true }, { 'x-sensenova-pool-admin': adminKey });
+  check('恢复展示 200', show.status === 200, JSON.stringify(show.body));
+  check('回调收到空列表', Array.isArray(modelsChanged.at(-1)) && modelsChanged.at(-1).length === 0, JSON.stringify(modelsChanged.at(-1)));
+
+  const unknown = await post('/plugins/dsh-sensenova-pool/keys', { action: 'set-model', id: 'no-such-model', enabled: false }, { 'x-sensenova-pool-admin': adminKey });
+  check('未知模型 → 404', unknown.status === 404, String(unknown.status));
+
+  const noId = await post('/plugins/dsh-sensenova-pool/keys', { action: 'set-model' }, { 'x-sensenova-pool-admin': adminKey });
+  check('缺 id → 400', noId.status === 400, String(noId.status));
 }
 
 console.log('\n[route] 未知操作与错误处理');

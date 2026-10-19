@@ -16,6 +16,11 @@
 
 ---
 
+> **想要一个独立运行、不依赖 DSH 的网关服务？** 请移步 **[Phoeky/st-rotator](https://github.com/Phoeky/st-rotator)**。
+> 本插件是它在 DeepSeek Harness 里的内嵌版：不装 DSH、或者需要给整个局域网提供服务时，用那个项目更合适。
+
+---
+
 ## 功能
 
 ### 🔑 多 Key 轮换池
@@ -63,6 +68,28 @@
 ### ⚙️ 零配置
 
 Key 存在 DSH 的凭据库里，不写进任何配置文件。填入即生效，无需重启 DSH、无需改 YAML。
+
+### 🧩 在 DSH 设置里管理
+
+设置侧栏新增 `dsh-sensenova-pool` 分区，Key 池、对外接口、模型可见性都在这一页。插件页里的卡片同样可以打开。
+
+### 🔌 提供对外的 OpenAI 兼容接口
+
+插件在 127.0.0.1 上起一个 OpenAI 兼容服务。设置页显示接口地址、端口和 API Key，复制后填进其他 Agent 或客户端即可使用；请求共用同一个 Key 池，遇到限流同样自动换 Key。
+
+```bash
+curl http://127.0.0.1:51234/v1/chat/completions \
+  -H "Authorization: Bearer sk-dsh-…" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"glm-5.2","messages":[{"role":"user","content":"ping"}]}'
+```
+
+- API Key 存在凭据库里，重启后不变
+- 端口由系统在启动时分配，设置页显示当前值
+
+### 🎛 管理可选择模型
+
+设置页列出目录里的全部模型。取消勾选的模型不再注册给 provider，也就不会出现在模型选择器里，这个选择重启后保留。套餐里不含某些模型时，可以在这里把它们关掉。
 
 ---
 
@@ -120,7 +147,7 @@ pnpm --dir "$DSH_PROFILE_DIR" add "link:$PWD"
 
 ### 1. 填入 Key
 
-打开 **插件 → dsh-sensenova-pool**，在弹出的卡片里粘贴一把或多把商汤 Key：
+打开 **设置 → dsh-sensenova-pool**（或插件页里本插件的卡片），在弹出的卡片里粘贴一把或多把商汤 Key：
 
 ```
 sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -142,6 +169,31 @@ sk-cccccccccccccccccccccccccccccc
 | **删除** | 移除单把 Key |
 | **清空全部** | 移除所有 Key |
 | **刷新模型列表** | 主动从商汤 `/v1/models` 拉取最新模型目录 |
+| **复制**（接口区） | 复制接口地址 / 对外 API Key |
+| **模型勾选框** | 决定该模型是否出现在模型选择器里 |
+
+### 4. 接入其他服务
+
+设置页「本地接口」区给出两样东西：
+
+| 字段 | 示例 | 说明 |
+|---|---|---|
+| 接口地址 | `http://127.0.0.1:51234/v1` | OpenAI 兼容，`/chat/completions`、`/models` 都支持，流式/非流式都行 |
+| API Key | `sk-dsh-…` | 填进 `Authorization: Bearer` 即可 |
+
+任何 OpenAI 客户端都可以直接用它，例如：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:51234/v1", api_key="sk-dsh-…")
+print(client.chat.completions.create(
+    model="glm-5.2",
+    messages=[{"role": "user", "content": "你好"}],
+).choices[0].message.content)
+```
+
+这个 Key 只被本地 shim 校验，**不会发给商汤**；真实的商汤 Key 始终只存在于插件内部。
 
 ---
 
@@ -169,11 +221,11 @@ sk-cccccccccccccccccccccccccccccc
 
 **模型选择器里没有「商汤日日新」分组？**
 
-确认 `dsh.profile.bundles` 里有 `dsh-sensenova-pool`，然后**重启 DSH**。
+确认 `dsh.profile.bundles` 里有 `dsh-sensenova-pool`，然后**重启 DSH**。如果分组在但某个模型不见了，去设置页看看是不是被自己勾掉了。
 
-**插件卡片打不开？**
+**管理卡片在哪？**
 
-在插件页「已安装」列表里点本插件进入详情页。
+两个入口都在：**设置 → dsh-sensenova-pool**（推荐），以及插件页里本插件的详情卡片。旧版 DSH 若没有设置分区，会退回只显示插件页卡片。
 
 **一直失败怎么办？**
 
@@ -214,6 +266,14 @@ records:
 
 不会。界面只显示掩码；明文只存在 DSH 凭据库（`$DSH_HOME/.credentials.yaml`）中，不会写入任何配置文件，也不会出现在日志里。
 
+**设置页里的 API Key 和我的商汤 Key 是一回事吗？**
+
+不是。设置页「本地接口」区显示的 `sk-dsh-…` 是**本地回环服务自己的**校验密钥，只用于让别的本地程序访问 `127.0.0.1` 上的 shim；它不会被转发给商汤，和你的商汤 Key 没有任何关系。真正的商汤 Key 仍然只以掩码形式出现在列表里。
+
+**别的机器能连这个接口吗？**
+
+不能，也不需要。shim 只绑定 `127.0.0.1`，这是刻意的：它背后是你的额度。要在多台机器/整个局域网共享，请用 [Phoeky/st-rotator](https://github.com/Phoeky/st-rotator) 这类独立网关。
+
 ---
 
 ## 环境要求
@@ -242,12 +302,17 @@ records:
 
 ## English
 
+> **Looking for a standalone gateway that runs without DSH?** See **[Phoeky/st-rotator](https://github.com/Phoeky/st-rotator)** — this plugin is its in-harness edition. Use that project if you don't run DeepSeek Harness or need to serve a whole LAN.
+
 **A multi-key rotation pool for SenseNova (商汤日日新) as a DeepSeek Harness plugin.**
 
 Paste one or more SenseNova API keys in one place and use every SenseNova model directly in the DSH chat window — rate-limited keys (HTTP 429) are switched out automatically and transparently.
 
 ### Features
 
+- **Managed in DSH Settings** — a settings section named `dsh-sensenova-pool` holds the key pool, the local endpoint and the model list
+- **An OpenAI-compatible endpoint** — the settings page shows the base URL, port and an API key to copy into another agent or client; requests share the same pool and the same 429 handling
+- **Choose which models appear** — uncheck a model and it stops being registered with the provider; the choice survives restarts
 - **Multi-key pool** — paste any number of keys at once (newline / comma / semicolon separated); prefixes, quotes, duplicates and junk are cleaned automatically
 - **Automatic 429 failover** — on rate limiting the pool immediately retries with the next key; each key cools down independently with exponential backoff and jitter, plus local RPM pre-throttling to avoid 429s in the first place
 - **Never leaks a 429 upward** — when every key is exhausted the plugin reports `503 + Retry-After` so DSH backs off on its own
@@ -264,7 +329,7 @@ Add `"dsh-sensenova-pool"` to `dsh.profile.bundles` in your profile `package.jso
 
 ### Usage
 
-Open **Plugins → dsh-sensenova-pool**, paste your keys, click **Add keys**, then pick any model under the "商汤日日新（Key 轮换池）" group in the model picker.
+Open **Settings → dsh-sensenova-pool** (or the plugin card on the Plugins page), paste your keys, click **Add keys**, then pick any model under the "商汤日日新（Key 轮换池）" group in the model picker. The same page shows the local endpoint (base URL, port, API key) and lets you hide models from the picker.
 
 ### Troubleshooting
 

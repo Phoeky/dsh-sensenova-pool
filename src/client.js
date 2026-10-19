@@ -1,5 +1,5 @@
 /**
- * 浏览器半：在 DSH 的「插件」页里给本 bundle 渲染一张 key 管理卡片。
+ * 浏览器半：在 DSH 的「设置」与「插件」页里渲染本插件的管理卡片。
  *
  * 为什么是这个文件形态
  * --------------------
@@ -15,9 +15,12 @@
  *
  * 槽位选择
  * --------
- * 用 `plugins.bundle.config`（keyed，键 = npm 包名）。这是 0.1.6+ 的现行槽位，
- * 卡片会出现在「插件」页里本 bundle 的详情中。同时注册 `settings.plugins.tab`
- * 作为设置页入口，两处都能进 —— 用户不必猜入口在哪。
+ * 1. `settings.section`（**一级设置分区**）—— 主入口。用户要求「key 管理页面在
+ *    DSH 的设置里」，这就是设置侧栏里与「通用 / 模型 / 插件」并列的那一类分区，
+ *    由 `@deepseek-ai/dsh-client-ui-settings` 声明，`ui-settings-general` 渲染。
+ * 2. `plugins.bundle.config`（keyed，键 = npm 包名）—— 「插件」页里本 bundle 的
+ *    详情卡片，保留原入口，用户不必猜。
+ * 3. `settings.plugins.tab` —— 「内置插件」分区里的标签页，第三个入口。
  *
  * 一个必须遵守的宿主约束
  * ----------------------
@@ -83,6 +86,7 @@ window.__ModuleLoader__.load({
       background: 'var(--dsw-alias-bg-module-platform)',
       fontWeight: 500,
     };
+    const smallButtonStyle = { ...buttonStyle, minHeight: 26, padding: '2px 10px', fontSize: 12 };
     const rowStyle = {
       display: 'flex',
       alignItems: 'center',
@@ -98,6 +102,29 @@ window.__ModuleLoader__.load({
       fontSize: 12,
       color: labelSecondary,
     };
+    /** 分区块：一条细分割线把「接口 / Key / 模型」三块隔开。 */
+    const blockStyle = {
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 8,
+      paddingTop: 16,
+      borderTop: `1px solid ${borderL2}`,
+    };
+    const blockTitleStyle = { margin: 0, fontSize: 14, fontWeight: 500, lineHeight: '22px', color: labelPrimary };
+    /** 只读值框：可整段选中，方便手抄。 */
+    const valueStyle = {
+      ...codeStyle,
+      flex: '1 1 260px',
+      minWidth: 0,
+      padding: '6px 8px',
+      border: `1px solid ${borderL2}`,
+      borderRadius: 6,
+      background: bgLayer1,
+      color: labelPrimary,
+      wordBreak: 'break-all',
+      userSelect: 'all',
+    };
+    const pageTitleStyle = { margin: 0, fontSize: 16, fontWeight: 500, lineHeight: '24px', color: labelPrimary };
 
     /** 状态徽标：颜色区分健康 / 冷却 / 失效。 */
     const badgeStyle = (status) => {
@@ -144,9 +171,48 @@ window.__ModuleLoader__.load({
       return value;
     }
 
+    /**
+     * 复制到剪贴板。
+     *
+     * `navigator.clipboard` 在 `dsh-app://` 这类自定义协议下不一定可用（安全上下文
+     * 判定因宿主而异），因此保留 `execCommand` 兜底 —— 它虽然过时，但在 Electron
+     * 渲染进程里一直有效。
+     */
+    async function copyText(text) {
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+          return true;
+        }
+      } catch {
+        // 落到下面的兜底。
+      }
+      try {
+        const area = document.createElement('textarea');
+        area.value = text;
+        area.style.position = 'fixed';
+        area.style.top = '-1000px';
+        area.style.opacity = '0';
+        document.body.appendChild(area);
+        area.focus();
+        area.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(area);
+        return ok;
+      } catch {
+        return false;
+      }
+    }
+
     // ------------------------------------------------------------------ 卡片
 
-    function KeyCard({ t }) {
+    /**
+     * 管理卡片：对外接口 + Key 池 + 模型可见性。
+     *
+     * @param props.t 文案读取器（宿主 locale 绑定）。
+     * @param props.variant 'section' 时渲染页面标题（设置分区里需要），'card' 时不渲染。
+     */
+    function KeyCard({ t, variant }) {
       const [draft, setDraft] = React.useState('');
       const [busy, setBusy] = React.useState(false);
       const [notice, setNotice] = React.useState(undefined);
@@ -154,8 +220,11 @@ window.__ModuleLoader__.load({
       const [keys, setKeys] = React.useState([]);
       const [summary, setSummary] = React.useState(undefined);
       const [catalog, setCatalog] = React.useState(undefined);
+      const [models, setModels] = React.useState([]);
+      const [endpoint, setEndpoint] = React.useState(undefined);
       const [adminKey, setAdminKey] = React.useState(undefined);
       const [tested, setTested] = React.useState({});
+      const [copied, setCopied] = React.useState('');
 
       const load = React.useCallback(async () => {
         try {
@@ -164,6 +233,8 @@ window.__ModuleLoader__.load({
           if (status) {
             setSummary(status.summary);
             setCatalog(status.catalog);
+            if (Array.isArray(status.models)) setModels(status.models);
+            if (status.endpoint) setEndpoint(status.endpoint);
             if (typeof status.adminKey === 'string') setAdminKey(status.adminKey);
           }
           setError(undefined);
@@ -228,10 +299,25 @@ window.__ModuleLoader__.load({
           return value.ok ? t('testOk', { ms: String(value.latencyMs) }) : t('testFail', { message: String(value.message).slice(0, 80) });
         });
 
+      const toggleModel = (id, enabled) =>
+        run('model', async () => {
+          await postJson(`${BASE}/keys`, { action: 'set-model', id, enabled }, adminKey);
+          return enabled ? t('modelShown', { id }) : t('modelHidden', { id });
+        });
+
+      const copy = async (field, text) => {
+        const ok = await copyText(text);
+        setCopied(ok ? field : '');
+        setNotice(ok ? t('copied') : undefined);
+        if (!ok) setError(t('copyFailed'));
+      };
+
       const canSave = !busy && draft.trim() !== '';
+      const enabledCount = models.filter((model) => model.enabled).length;
+      const endpointReady = endpoint !== undefined && typeof endpoint.baseUrl === 'string' && endpoint.baseUrl !== '';
 
       return h('div', { style: rootStyle }, [
-        // ---- 顶部说明 + 池状态 ----
+        variant === 'section' ? h('h2', { key: 'title', style: pageTitleStyle }, t('nav')) : null,
         h('p', { key: 'hint', style: hintStyle }, t('hint')),
 
         summary
@@ -250,72 +336,160 @@ window.__ModuleLoader__.load({
             )
           : null,
 
-        // ---- 输入区 ----
-        h('textarea', {
-          key: 'draft',
-          style: areaStyle,
-          value: draft,
-          spellCheck: false,
-          rows: 3,
-          placeholder: t('placeholder'),
-          onChange: (event) => {
-            setDraft(event.target.value);
-          },
-        }),
+        // ---- 对外接口：地址 / 端口 / API Key ------------------------------
+        h('div', { key: 'endpoint', style: blockStyle }, [
+          h('h3', { key: 'title', style: blockTitleStyle }, t('endpointTitle')),
+          h('p', { key: 'hint', style: hintStyle }, t('endpointHint')),
 
-        h('div', { key: 'actions', style: { display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' } }, [
-          h(
-            'button',
-            {
-              key: 'save',
-              type: 'button',
-              style: canSave ? buttonPrimaryStyle : { ...buttonPrimaryStyle, opacity: 0.5, cursor: 'default' },
-              disabled: !canSave,
-              onClick: addKeys,
+          endpointReady
+            ? h('div', { key: 'rows', style: { display: 'flex', flexDirection: 'column', gap: 8 } }, [
+                h('div', { key: 'url', style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } }, [
+                  h('span', { key: 'label', style: { ...codeStyle, flex: '0 0 84px', color: labelTertiary } }, t('endpointUrl')),
+                  h('code', { key: 'value', style: valueStyle }, endpoint.baseUrl),
+                  h(
+                    'button',
+                    {
+                      key: 'copy',
+                      type: 'button',
+                      style: smallButtonStyle,
+                      disabled: busy,
+                      onClick: () => copy('url', endpoint.baseUrl),
+                    },
+                    copied === 'url' ? t('copied') : t('copy'),
+                  ),
+                ]),
+                h('div', { key: 'key', style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } }, [
+                  h('span', { key: 'label', style: { ...codeStyle, flex: '0 0 84px', color: labelTertiary } }, t('endpointKey')),
+                  h('code', { key: 'value', style: valueStyle }, endpoint.apiKey || '—'),
+                  h(
+                    'button',
+                    {
+                      key: 'copy',
+                      type: 'button',
+                      style: smallButtonStyle,
+                      disabled: busy || !endpoint.apiKey,
+                      onClick: () => copy('key', endpoint.apiKey),
+                    },
+                    copied === 'key' ? t('copied') : t('copy'),
+                  ),
+                ]),
+              ])
+            : h('p', { key: 'down', style: { ...hintStyle, color: 'var(--dsw-alias-label-warning, #bf8700)' } }, t('endpointDown')),
+        ]),
+
+        // ---- Key 池 -------------------------------------------------------
+        h('div', { key: 'pool', style: blockStyle }, [
+          h('h3', { key: 'title', style: blockTitleStyle }, t('keysTitle')),
+          h('textarea', {
+            key: 'draft',
+            style: areaStyle,
+            value: draft,
+            spellCheck: false,
+            rows: 3,
+            placeholder: t('placeholder'),
+            onChange: (event) => {
+              setDraft(event.target.value);
             },
-            busy ? t('working') : t('save'),
-          ),
-          h('button', { key: 'refresh', type: 'button', style: buttonStyle, disabled: busy, onClick: refreshCatalog }, t('refreshCatalog')),
-          keys.length > 0
-            ? h('button', { key: 'clear', type: 'button', style: buttonStyle, disabled: busy, onClick: clearKeys }, t('clear'))
+          }),
+          h('div', { key: 'actions', style: { display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' } }, [
+            h(
+              'button',
+              {
+                key: 'save',
+                type: 'button',
+                style: canSave ? buttonPrimaryStyle : { ...buttonPrimaryStyle, opacity: 0.5, cursor: 'default' },
+                disabled: !canSave,
+                onClick: addKeys,
+              },
+              busy ? t('working') : t('save'),
+            ),
+            h('button', { key: 'refresh', type: 'button', style: buttonStyle, disabled: busy, onClick: refreshCatalog }, t('refreshCatalog')),
+            keys.length > 0
+              ? h('button', { key: 'clear', type: 'button', style: buttonStyle, disabled: busy, onClick: clearKeys }, t('clear'))
+              : null,
+          ]),
+
+          keys.length === 0
+            ? h('p', { key: 'empty', style: hintStyle }, t('empty'))
+            : h(
+                'ul',
+                { key: 'list', style: listStyle },
+                keys.map((row) => {
+                  const probe = tested[row.id];
+                  return h('li', { key: row.id, style: rowStyle }, [
+                    h('span', { key: 'mask', style: { ...codeStyle, flex: '1 1 auto', wordBreak: 'break-all' } }, row.key),
+                    h('span', { key: 'status', style: badgeStyle(row.status) }, t(`status_${row.status}`)),
+                    h(
+                      'span',
+                      { key: 'stats', style: { ...codeStyle, flex: '0 0 auto' } },
+                      t('stats', { ok: String(row.stats.successes), total: String(row.stats.requests), limited: String(row.stats.rateLimited) }),
+                    ),
+                    row.status === 'cooldown' && row.cooldownRemaining > 0
+                      ? h('span', { key: 'cd', style: { ...codeStyle, flex: '0 0 auto' } }, t('cooldown', { s: String(row.cooldownRemaining) }))
+                      : null,
+                    probe
+                      ? h(
+                          'span',
+                          {
+                            key: 'probe',
+                            style: {
+                              ...codeStyle,
+                              flex: '0 0 auto',
+                              color: probe.ok ? 'var(--dsw-alias-label-success, #2ea043)' : 'var(--dsw-alias-label-danger, #cf222e)',
+                            },
+                          },
+                          probe.ok ? `✓ ${probe.latencyMs}ms` : `✗ ${probe.status || 'err'}`,
+                        )
+                      : null,
+                    h('button', { key: 'test', type: 'button', style: smallButtonStyle, disabled: busy, onClick: () => testKey(row.id) }, t('test')),
+                    h('button', { key: 'del', type: 'button', style: smallButtonStyle, disabled: busy, onClick: () => removeKey(row.id) }, t('remove')),
+                  ]);
+                }),
+              ),
+        ]),
+
+        // ---- 模型可见性 ---------------------------------------------------
+        h('div', { key: 'models', style: blockStyle }, [
+          h('h3', { key: 'title', style: blockTitleStyle }, t('modelsTitle')),
+          h('p', { key: 'hint', style: hintStyle }, t('modelsHint', { count: String(enabledCount), total: String(models.length) })),
+          enabledCount === 0 && models.length > 0
+            ? h('p', { key: 'warn', style: { ...hintStyle, color: 'var(--dsw-alias-label-warning, #bf8700)' } }, t('modelsAllHidden'))
             : null,
+          models.length === 0
+            ? h('p', { key: 'empty', style: hintStyle }, t('modelsEmpty'))
+            : h(
+                'ul',
+                { key: 'list', style: listStyle },
+                models.map((model) =>
+                  h(
+                    'li',
+                    { key: model.id, style: { ...rowStyle, padding: '6px 10px' } },
+                    h(
+                      'label',
+                      { style: { display: 'flex', alignItems: 'center', gap: 10, flex: '1 1 auto', minWidth: 0, cursor: 'pointer' } },
+                      [
+                        h('input', {
+                          key: 'box',
+                          type: 'checkbox',
+                          checked: model.enabled === true,
+                          disabled: busy,
+                          onChange: (event) => toggleModel(model.id, event.target.checked),
+                        }),
+                        h(
+                          'span',
+                          { key: 'name', style: { fontSize: 13, color: model.enabled ? labelPrimary : labelTertiary, flex: '0 0 auto' } },
+                          model.name,
+                        ),
+                        h('span', { key: 'id', style: { ...codeStyle, flex: '1 1 auto', wordBreak: 'break-all' } }, model.id),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
         ]),
 
         notice ? h('p', { key: 'notice', role: 'status', style: { ...hintStyle, color: labelSecondary } }, notice) : null,
         error ? h('p', { key: 'error', role: 'alert', style: { ...hintStyle, color: 'var(--dsw-alias-label-danger, #cf222e)' } }, error) : null,
-
-        // ---- 已有 key 列表 ----
-        keys.length === 0
-          ? h('p', { key: 'empty', style: hintStyle }, t('empty'))
-          : h(
-              'ul',
-              { key: 'list', style: listStyle },
-              keys.map((row) => {
-                const probe = tested[row.id];
-                return h('li', { key: row.id, style: rowStyle }, [
-                  h('span', { key: 'mask', style: { ...codeStyle, flex: '1 1 auto', wordBreak: 'break-all' } }, row.key),
-                  h(
-                    'span',
-                    { key: 'status', style: badgeStyle(row.status) },
-                    t(`status_${row.status}`),
-                  ),
-                  h('span', { key: 'stats', style: { ...codeStyle, flex: '0 0 auto' } }, t('stats', { ok: String(row.stats.successes), total: String(row.stats.requests), limited: String(row.stats.rateLimited) })),
-                  row.status === 'cooldown' && row.cooldownRemaining > 0
-                    ? h('span', { key: 'cd', style: { ...codeStyle, flex: '0 0 auto' } }, t('cooldown', { s: String(row.cooldownRemaining) }))
-                    : null,
-                  probe
-                    ? h('span', { key: 'probe', style: { ...codeStyle, flex: '0 0 auto', color: probe.ok ? 'var(--dsw-alias-label-success, #2ea043)' : 'var(--dsw-alias-label-danger, #cf222e)' } }, probe.ok ? `✓ ${probe.latencyMs}ms` : `✗ ${probe.status || 'err'}`)
-                    : null,
-                  h('button', { key: 'test', type: 'button', style: { ...buttonStyle, minHeight: 26, padding: '2px 10px', fontSize: 12 }, disabled: busy, onClick: () => testKey(row.id) }, t('test')),
-                  h('button', { key: 'del', type: 'button', style: { ...buttonStyle, minHeight: 26, padding: '2px 10px', fontSize: 12 }, disabled: busy, onClick: () => removeKey(row.id) }, t('remove')),
-                ]);
-              }),
-            ),
-
-        // ---- 模型列表（让用户确认接入了什么） ----
-        catalog && catalog.count > 0
-          ? h('p', { key: 'models', style: { ...hintStyle, fontSize: 12 } }, t('modelsHint', { count: String(catalog.count) }))
-          : null,
       ]);
     }
 
@@ -349,7 +523,21 @@ window.__ModuleLoader__.load({
       status_cooldown: 'cooling',
       status_invalid: 'invalid',
       cooldown: '{s}s',
-      modelsHint: '{count} models available in the model picker.',
+      endpointTitle: 'Local endpoint',
+      endpointHint: 'An OpenAI-compatible endpoint exposed for other agents. Put the URL and API key into any other agent and it works.',
+      endpointUrl: 'Base URL',
+      endpointKey: 'API key',
+      endpointDown: 'The local endpoint is not running; the keys are still usable inside DSH.',
+      copy: 'Copy',
+      copied: 'Copied',
+      copyFailed: 'Copy failed — select the text and copy manually.',
+      keysTitle: 'Key pool',
+      modelsTitle: 'Models in the picker',
+      modelsHint: '{count} of {total} models are shown in the model picker.',
+      modelsAllHidden: 'Every model is hidden — the picker will be empty until you re-enable one.',
+      modelsEmpty: 'No models yet. Add a key and refresh the list.',
+      modelShown: '{id} is now shown',
+      modelHidden: '{id} is hidden',
     };
 
     const zh = {
@@ -380,7 +568,21 @@ window.__ModuleLoader__.load({
       status_cooldown: '冷却中',
       status_invalid: '已失效',
       cooldown: '{s}s',
-      modelsHint: '模型选择器里有 {count} 个模型可用。',
+      endpointTitle: '本地接口',
+      endpointHint: '对外提供的 OpenAI 兼容接口。把 url 和 API Key 填进其他 Agent 即可直接使用。',
+      endpointUrl: '接口地址',
+      endpointKey: 'API Key',
+      endpointDown: '本地接口未启动；Key 在 DSH 内仍可正常使用。',
+      copy: '复制',
+      copied: '已复制',
+      copyFailed: '复制失败，请手动选中文本复制。',
+      keysTitle: 'Key 池',
+      modelsTitle: '下拉中的模型',
+      modelsHint: '共 {total} 个模型，当前展示 {count} 个。',
+      modelsAllHidden: '所有模型都被隐藏了，模型选择器会是空的 —— 至少勾回一个。',
+      modelsEmpty: '还没有模型，请先添加 key 并刷新列表。',
+      modelShown: '已展示 {id}',
+      modelHidden: '已隐藏 {id}',
     };
 
     // ------------------------------------------------------------ 错误隔离
@@ -414,7 +616,29 @@ window.__ModuleLoader__.load({
 
       const t = ctx.locale.bind(NS);
 
-      // 槽位一：插件页里本 bundle 的配置区（0.1.6+ 的现行位置）。
+      // 槽位一（主入口）：设置侧栏里的一级分区，与「通用 / 模型 / 插件」并列。
+      guardClientContribution('settings.section', () => {
+        ctx.slots.inject('settings.section', () =>
+          guardClientContribution('settings.section', () =>
+            ctx.slots.register(
+              {
+                name: 'settings.section',
+                id: 'sensenova-pool',
+                // 排在「通用(0) / 模型 / 账号 / 插件」之后，避免挤掉宿主自己的顺序。
+                order: 40,
+                // 侧栏栏目名用包名：设置里一眼能对上是哪个插件。
+                // 页内标题仍用中文名（见 t('nav')），两者刻意不同。
+                label: () => BUNDLE_NAME,
+                locale: NS,
+                inject: () => ({ t }),
+              },
+              ({ t: seat }) => h(KeyCard, { t: seat, variant: 'section' }),
+            ),
+          ),
+        );
+      });
+
+      // 槽位二：插件页里本 bundle 的配置区（0.1.6+ 的现行位置）。
       guardClientContribution('plugins.bundle.config', () => {
         ctx.slots.inject('plugins.bundle.config', () =>
           guardClientContribution('plugins.bundle.config', () =>
@@ -425,13 +649,13 @@ window.__ModuleLoader__.load({
                 locale: NS,
                 inject: () => ({ t }),
               },
-              ({ view, t: seat }) => (view === 'summary' ? seat('hint') : h(KeyCard, { t: seat })),
+              ({ view, t: seat }) => (view === 'summary' ? seat('hint') : h(KeyCard, { t: seat, variant: 'card' })),
             ),
           ),
         );
       });
 
-      // 槽位二：设置页的插件标签页，给用户第二个入口。
+      // 槽位三：设置页的插件标签页，给用户第三个入口。
       guardClientContribution('settings.plugins.tab', () => {
         ctx.slots.inject('settings.plugins.tab', () =>
           guardClientContribution('settings.plugins.tab', () =>
@@ -440,11 +664,11 @@ window.__ModuleLoader__.load({
                 name: 'settings.plugins.tab',
                 id: BUNDLE_NAME,
                 order: 40,
-                label: () => t('nav'),
+                label: () => BUNDLE_NAME,
                 locale: NS,
                 inject: () => ({ t }),
               },
-              ({ t: seat }) => h(KeyCard, { t: seat }),
+              ({ t: seat }) => h(KeyCard, { t: seat, variant: 'card' }),
             ),
           ),
         );

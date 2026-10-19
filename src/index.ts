@@ -150,6 +150,25 @@ export function apply(ctx: any, config: PluginConfig): void {
     maxConcurrency: resolved.maxConcurrency,
   });
 
+  /**
+   * 被用户隐藏的模型 id。
+   *
+   * 「下拉里展示什么」是用户自己的偏好，与 key 一样跨重启保留：勾掉的模型不进入
+   * `buildModels()`，因此不会出现在模型选择器里（上游仍然可用，只是不展示）。
+   */
+  const disabledModels = new Set<string>();
+
+  /**
+   * 对外暴露的 API Key（别的服务用它访问本地 shim）。
+   *
+   * 持久化在凭据记录里，重启后保持不变 —— 否则每次启动都换一把，外部服务就得
+   * 反复改配置。启动装载完成前它是空串，此时 shim 用的是进程内随机密钥。
+   */
+  let externalKey = '';
+
+  /** 凭据库里是否**已有**本插件的记录（决定首次装载后要不要立刻补写）。 */
+  let recordExisted = false;
+
   /** 最近的轮换事件，供状态页展示「刚才发生了什么」。 */
   const recentRotations: Array<{ keyId: string; kind: string; status: number; message: string; at: number }> = [];
 
@@ -175,6 +194,22 @@ export function apply(ctx: any, config: PluginConfig): void {
     summary: () => pool.summary(),
     catalog: () => catalog.status(),
     rotations: () => recentRotations.slice(0, 20),
+    endpoint: () => {
+      // shim 监听失败时 baseUrl() 会抛；这里降级成空串，让界面显示「不可用」而不是崩。
+      try {
+        return { baseUrl: `${shim.baseUrl()}/v1`, port: shim.port(), apiKey: shim.token() };
+      } catch {
+        return { baseUrl: '', port: 0, apiKey: shim.token() };
+      }
+    },
+    models: () =>
+      catalog.current().map((model) => ({
+        id: model.id,
+        name: model.name,
+        contextWindow: model.contextWindow,
+        maxTokens: model.maxTokens,
+        enabled: !disabledModels.has(model.id),
+      })),
     providerId: PROVIDER_ID,
     providerName: PROVIDER_NAME,
     baseUrl: resolved.baseUrl,
@@ -183,14 +218,27 @@ export function apply(ctx: any, config: PluginConfig): void {
   // ---------------------------------------------------------------- 凭据装载
 
   /**
-   * 从 DSH 凭据库读取本插件的 key 列表。
+   * 从 DSH 凭据库读取本插件的状态。
    *
-   * 存储方案：一个 `<scope>/keys` 记录，payload 里放 key 数组。用记录而不是
-   * 环境变量引用，是因为用户要求「可以填多把 key」——环境变量引用是单值的，
-   * 无法表达一个池子。
+   * 存储方案：一个 `<scope>/keys` 记录，payload 里放 key 数组、被隐藏的模型 id，
+   * 以及对外暴露的 API Key。用记录而不是环境变量引用，是因为用户要求「可以填多把
+   * key」——环境变量引用是单值的，无法表达一个池子。
+   *
+   * 为什么把「模型可见性」和「对外密钥」也塞进这条记录：DSH 的 settings 服务是
+   * 围绕插件 Config + profile patch 的配置编辑器，不是通用 KV；为这两个字段单开
+   * 一套持久化路径不值得。grant 的 payload 是**逐字保留**的，多几个字段完全安全。
    */
   const RECORD_SCOPE = 'dsh-sensenova-pool';
   const RECORD_ID = `${RECORD_SCOPE}/keys`;
+
+  /** 凭据记录里我们自己的 payload 形状（全部字段可选，便于向前兼容）。 */
+  interface PoolPayload {
+    keys?: unknown;
+    /** 被用户隐藏的模型 id（不进入模型选择器）。 */
+    disabledModels?: unknown;
+    /** 对外暴露给其他本地服务的 API Key。 */
+    externalKey?: unknown;
+  }
 
   /**
    * 写入前等待首次权威装载的上限（毫秒）。
@@ -250,15 +298,37 @@ export function apply(ctx: any, config: PluginConfig): void {
   });
 
   /**
-   * 装载 key，并在**凭据快照确实可读**时宣告首次权威装载完成。
+   * 装载 key、模型可见性与对外密钥，并在**凭据快照确实可读**时宣告首次权威装载完成。
    *
    * 只有凭据服务可见时才宣告：否则「池子为空」只代表「还没读到」，不代表「真的没有
    * key」，提前宣告会让 `saveKeys()` 把空池覆盖写回记录。
    */
   async function loadKeysAndNotify(): Promise<number> {
     const added = await loadKeys();
-    if (credentialsService() !== undefined) notifyKeysLoaded?.();
+    if (credentialsService() !== undefined) {
+      // 记录里还没有对外密钥时生成一把。是否立刻落盘取决于记录**原本是否存在**：
+      //   - 存在（老用户 / 已用过插件）→ 补写一次，把这把密钥固化下来；
+      //   - 不存在（首次安装）→ 只放在内存里，等用户第一次添加 key 时随那次写入
+      //     一起落盘，避免仅为一把尚未使用的密钥就在凭据库里建记录。
+      if (!externalKey) {
+        externalKey = newExternalKey();
+        shim.setToken(externalKey);
+        if (recordExisted) {
+          try {
+            await persistRecord();
+          } catch (error) {
+            logger.warn(`对外密钥落盘失败（本次会话仍可用）：${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+      }
+      notifyKeysLoaded?.();
+    }
     return added;
+  }
+
+  /** 生成一把形如商汤 key 的对外密钥（只被本地 shim 校验，不发给上游）。 */
+  function newExternalKey(): string {
+    return `sk-dsh-${randomBytes(24).toString('hex')}`;
   }
 
   async function loadKeys(): Promise<number> {
@@ -267,18 +337,35 @@ export function apply(ctx: any, config: PluginConfig): void {
       logger.warn('凭据服务不可用，key 池保持为空');
       return 0;
     }
-    let record: { kind?: string; payload?: { keys?: unknown } } | undefined;
+    let record: { kind?: string; payload?: PoolPayload } | undefined;
     try {
       record = await credentials.readRecord(RECORD_ID);
     } catch (error) {
       logger.warn(`读取 key 记录失败：${error instanceof Error ? error.message : String(error)}`);
       return 0;
     }
-    const keys = Array.isArray(record?.payload?.keys) ? (record?.payload?.keys as unknown[]) : [];
+    const payload = record?.payload ?? {};
+    recordExisted = record !== undefined && record !== null;
+    const keys = Array.isArray(payload.keys) ? payload.keys : [];
     let added = 0;
     for (const raw of keys) {
       if (typeof raw === 'string' && pool.addKey(raw)) added += 1;
     }
+
+    // 模型可见性：记录里没有该字段时表示「全部展示」。
+    disabledModels.clear();
+    if (Array.isArray(payload.disabledModels)) {
+      for (const id of payload.disabledModels) {
+        if (typeof id === 'string' && id.length > 0) disabledModels.add(id);
+      }
+    }
+
+    // 对外密钥：拿到持久化的那把后立刻换上，DSH 与外部服务从此用同一个。
+    if (typeof payload.externalKey === 'string' && payload.externalKey.length >= 16) {
+      externalKey = payload.externalKey;
+      shim.setToken(externalKey);
+    }
+
     if (added > 0) logger.info(`已装载 ${added} 把 key`);
     return added;
   }
@@ -296,18 +383,15 @@ export function apply(ctx: any, config: PluginConfig): void {
     });
   }
 
-  async function saveKeys(): Promise<void> {
-    // 写入前必须确保首次**权威**装载已完成：saveKeys 是整体覆盖写，若此时池子还是
-    // 空的（快照尚未读到），磁盘上原有的 key 会被这次写入静默抹掉。
-    //
-    // 只在凭据服务**确实存在**时才等：宿主压根没有该服务时，等它没有意义，直接让
-    // 下面给出明确错误，而不是让用户对着转圈的按钮等满超时。
-    if (credentialsRegistered()) {
-      await Promise.race([firstAuthoritativeLoad, delay(SAVE_LOAD_WAIT_MS)]);
-    }
+  /**
+   * 把当前内存状态整体写回记录（**不等待**权威装载）。
+   *
+   * 只给两条路径用：启动装载完成后的补写（此时快照刚读过，权威），以及已经等过
+   * `firstAuthoritativeLoad` 的 `saveKeys()`。别在启动早期直接调它。
+   */
+  async function persistRecord(): Promise<void> {
     const credentials = credentialsService();
-    if (credentials === undefined) throw new Error('凭据服务不可用，无法保存 key');
-    const keys = pool.keys();
+    if (credentials === undefined) throw new Error('凭据服务不可用，无法保存');
     // 必须用 `grant`，不能用 `api-key`。
     //
     // credentials-local 对记录做白名单校验（`assertFields`），两种标签允许的字段
@@ -324,47 +408,68 @@ export function apply(ctx: any, config: PluginConfig): void {
     // 的标签必须与 schema 严格对齐。
     await credentials.modifyRecord(RECORD_ID, async () => ({
       kind: 'grant',
-      payload: { keys },
+      payload: {
+        keys: pool.keys(),
+        disabledModels: [...disabledModels],
+        externalKey,
+      },
     }));
+  }
+
+  async function saveKeys(): Promise<void> {
+    // 写入前必须确保首次**权威**装载已完成：写入是整体覆盖，若此时池子还是
+    // 空的（快照尚未读到），磁盘上原有的 key 会被这次写入静默抹掉。
+    //
+    // 只在凭据服务**确实存在**时才等：宿主压根没有该服务时，等它没有意义，直接让
+    // 下面给出明确错误，而不是让用户对着转圈的按钮等满超时。
+    if (credentialsRegistered()) {
+      await Promise.race([firstAuthoritativeLoad, delay(SAVE_LOAD_WAIT_MS)]);
+    }
+    if (credentialsService() === undefined) throw new Error('凭据服务不可用，无法保存 key');
+    await persistRecord();
   }
 
   // ------------------------------------------------------------ provider 注册
 
   function buildModels(): any[] {
     const baseUrl = `${shim.baseUrl()}/v1`;
-    return catalog.current().map((model: SenseNovaModel) => ({
-      id: model.id,
-      name: model.name,
-      api: 'openai-completions',
-      provider: PROVIDER_ID,
-      baseUrl,
-      input: model.supportsImages ? ['text', 'image'] : ['text'],
-      // 商汤的思考等级。
-      //
-      // 取值经**实测**确定：`reasoning_effort` 只接受
-      // `none | low | medium | high | xhigh`。传 `off` / `max` / `minimal`
-      // 会得到 400 `field ReasoningEffort invalid`（曾经踩过这个坑）。
-      // 因此这里把 DSH 的等级名映射到商汤的拼写：
-      //   off → none（关闭思考），minimal → 不支持，max → xhigh（最高的合法档）。
-      reasoning: model.reasoning,
-      ...(model.reasoning
-        ? {
-            thinkingLevelMap: {
-              off: 'none',
-              minimal: null,
-              low: 'low',
-              medium: 'medium',
-              high: 'high',
-              xhigh: 'xhigh',
-              max: 'xhigh',
-            },
-          }
-        : {}),
-      cost: NO_COST,
-      contextWindow: model.contextWindow,
-      maxTokens: model.maxTokens,
-      compat: { maxTokensField: 'max_tokens' },
-    }));
+    return catalog
+      .current()
+      // 用户在下拉里勾掉的模型不注册，因此不会出现在模型选择器里。
+      .filter((model) => !disabledModels.has(model.id))
+      .map((model: SenseNovaModel) => ({
+        id: model.id,
+        name: model.name,
+        api: 'openai-completions',
+        provider: PROVIDER_ID,
+        baseUrl,
+        input: model.supportsImages ? ['text', 'image'] : ['text'],
+        // 商汤的思考等级。
+        //
+        // 取值经**实测**确定：`reasoning_effort` 只接受
+        // `none | low | medium | high | xhigh`。传 `off` / `max` / `minimal`
+        // 会得到 400 `field ReasoningEffort invalid`（曾经踩过这个坑）。
+        // 因此这里把 DSH 的等级名映射到商汤的拼写：
+        //   off → none（关闭思考），minimal → 不支持，max → xhigh（最高的合法档）。
+        reasoning: model.reasoning,
+        ...(model.reasoning
+          ? {
+              thinkingLevelMap: {
+                off: 'none',
+                minimal: null,
+                low: 'low',
+                medium: 'medium',
+                high: 'high',
+                xhigh: 'xhigh',
+                max: 'xhigh',
+              },
+            }
+          : {}),
+        cost: NO_COST,
+        contextWindow: model.contextWindow,
+        maxTokens: model.maxTokens,
+        compat: { maxTokensField: 'max_tokens' },
+      }));
   }
 
   function createAdapter(): PiAiAdapter {
@@ -591,33 +696,57 @@ export function apply(ctx: any, config: PluginConfig): void {
 
   // --------------------------------------------------------------- 可选界面
 
+  /**
+   * 保存 key 列表并刷新模型目录。
+   *
+   * 顺序有讲究：先落盘再 refreshCatalog —— 刷新会让模型选择器立刻重读模型，
+   * 若此时记录还没写成功，用户会看到「列表变了但重启又回去了」。
+   */
+  const handleKeysChanged = async (): Promise<void> => {
+    await saveKeys();
+    refreshCatalog();
+    void fetchCatalogFromUpstream();
+  };
+
+  /**
+   * 应用「哪些模型出现在下拉里」。
+   *
+   * 落盘失败不算失败：可见性已经作用于内存，下次写入会一并带上；这里只记一条
+   * 日志，不让界面上的勾选因为磁盘问题而回弹。
+   */
+  const handleModelsChanged = async (nextDisabled: string[]): Promise<void> => {
+    disabledModels.clear();
+    for (const id of nextDisabled) {
+      if (typeof id === 'string' && id.length > 0) disabledModels.add(id);
+    }
+    refreshCatalog();
+    try {
+      await saveKeys();
+    } catch (error) {
+      logger.warn(`模型可见性落盘失败（本次会话已生效）：${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
   // 设置页：填 key（用户明确要求只在设置页填）。
   try {
     registerSettingsSection(ctx, {
       namespace: SETTINGS_NS,
       config,
       pool,
-      onKeysChanged: async () => {
-        await saveKeys();
-        refreshCatalog();
-        void fetchCatalogFromUpstream();
-      },
+      onKeysChanged: handleKeysChanged,
     });
   } catch (error) {
     logger.warn(`设置页注册失败（不影响模型可用）：${error instanceof Error ? error.message : String(error)}`);
   }
 
-  // Web 路由：给设置卡片读写 key / 查看池状态用。
+  // Web 路由：给设置卡片读写 key / 模型可见性 / 查看对外接口。
   try {
     registerKeyRoutes(ctx, {
       status,
       pool,
       logger,
-      onKeysChanged: async () => {
-        await saveKeys();
-        refreshCatalog();
-        void fetchCatalogFromUpstream();
-      },
+      onKeysChanged: handleKeysChanged,
+      onModelsChanged: handleModelsChanged,
       reload: async () => {
         // 手动重载：走同一套「装载并宣告」逻辑，因此在启动早期点它也不会把
         // 「还没读到」误当成「真的没有 key」而清空权威装载信号。

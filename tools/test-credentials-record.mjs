@@ -174,6 +174,35 @@ check('校验桩能识破 api-key + payload 的坏形状', rejectsBadShape);
 
 check('落盘过程没有 warn 日志', !warnings.some((m) => m.includes('keys route')), JSON.stringify(warnings));
 
+// ---- 模型可见性：隐藏一个模型后，provider 的模型列表里必须真的没有它 ---------
+{
+  const adapter = globalThis.__capture.adapters.at(-1);
+  const modelsOf = () => {
+    const profile = adapter.profiles().get('sensenova-pool');
+    return profile.piProvider.getModels().map((m) => m.id);
+  };
+  const before = modelsOf();
+  check('模型列表非空（可做可见性验证）', before.length > 1, JSON.stringify(before));
+
+  const target = before[0];
+  const hideRes = await fetch(`${origin}/plugins/dsh-sensenova-pool/keys`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-sensenova-pool-admin': adminKey },
+    body: JSON.stringify({ action: 'set-model', id: target, enabled: false }),
+  });
+  check('POST set-model → 200', hideRes.status === 200, `status=${hideRes.status}`);
+  await hideRes.json();
+
+  const after = modelsOf();
+  check('被隐藏的模型不再注册', !after.includes(target), JSON.stringify(after));
+  check('其余模型仍在', after.length === before.length - 1, `${before.length} → ${after.length}`);
+
+  const last = written.at(-1)?.record;
+  check('隐藏列表已落盘', Array.isArray(last?.payload?.disabledModels) && last.payload.disabledModels.includes(target), JSON.stringify(last?.payload));
+  check('落盘仍保留 key', Array.isArray(last?.payload?.keys) && last.payload.keys.length === 2, JSON.stringify(last?.payload?.keys));
+  check('落盘带对外密钥', typeof last?.payload?.externalKey === 'string' && last.payload.externalKey.startsWith('sk-dsh-'), String(last?.payload?.externalKey));
+}
+
 // 关掉测试自己的 HTTP 服务。
 //
 // `server.close()` 只是停止接受新连接，**不会**关闭已经空闲的 keep-alive 连接：

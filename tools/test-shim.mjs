@@ -58,6 +58,36 @@ console.log('\n[shim] 认证与安全边界');
   await shim.close();
 }
 
+console.log('\n[shim] 对外密钥切换（setToken）');
+{
+  const pool = new KeyPool(['sk-test0001'], {});
+  const catalog = new ModelCatalog();
+  const shim = createShim({ pool, catalog, baseUrl: UPSTREAM });
+  await shim.ready;
+  const base = shim.baseUrl();
+  const before = shim.token();
+
+  const persisted = 'sk-dsh-persisted-external-key-0001';
+  shim.setToken(persisted);
+  check('token() 返回新密钥', shim.token() === persisted, shim.token());
+  check('端口可读且为正整数', Number.isInteger(shim.port()) && shim.port() > 0, String(shim.port()));
+
+  const withNew = await realFetch(`${base}/healthz`, { headers: { authorization: `Bearer ${persisted}` } });
+  check('新密钥可用', withNew.status === 200, String(withNew.status));
+  await withNew.text();
+
+  // 旧密钥继续被接受：pi-ai 可能缓存了 resolveApiKey 的结果，切换瞬间不该 401。
+  const withOld = await realFetch(`${base}/healthz`, { headers: { authorization: `Bearer ${before}` } });
+  check('旧密钥仍被接受（避免在途请求 401）', withOld.status === 200, String(withOld.status));
+  await withOld.text();
+
+  const empty = await realFetch(`${base}/healthz`, { headers: { authorization: 'Bearer ' } });
+  check('空 Bearer 仍被拒 401', empty.status === 401, String(empty.status));
+  await empty.text();
+
+  await shim.close();
+}
+
 console.log('\n[shim] 429 在 shim 内部被消化，上层看不到 429');
 {
   const pool = new KeyPool(['sk-key1', 'sk-key2', 'sk-key3'], { maxConcurrency: 4 });

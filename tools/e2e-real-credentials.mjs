@@ -151,6 +151,32 @@ if (webServer?.routes?.has('/plugins/dsh-sensenova-pool/status')) {
   try { status = JSON.parse(captured); } catch { /* ignore */ }
   check('/status 报告池里有 2 把 key', status?.summary?.total === 2, JSON.stringify(status?.summary));
   check('/status 的 key 均已脱敏（不含明文）', (status?.keys ?? []).every((k) => !KEYS.includes(k.key)), JSON.stringify(status?.keys?.map((k) => k.key)));
+
+  // 0.2.0 新增：对外接入信息与模型可见性。这里用**真实** shim，端口应真实可连。
+  check(
+    '/status 给出回环接口地址',
+    typeof status?.endpoint?.baseUrl === 'string' && status.endpoint.baseUrl.startsWith('http://127.0.0.1:'),
+    JSON.stringify(status?.endpoint),
+  );
+  check('接口地址的端口与 shim 实际监听一致', (() => {
+    const port = Number(new URL(status.endpoint.baseUrl).port);
+    return Number.isInteger(port) && port > 0 && status.endpoint.port === port;
+  })(), JSON.stringify(status?.endpoint));
+  check(
+    '/status 给出对外 API Key',
+    typeof status?.endpoint?.apiKey === 'string' && status.endpoint.apiKey.startsWith('sk-dsh-'),
+    String(status?.endpoint?.apiKey),
+  );
+  check(
+    '对外 API Key 与商汤 key 无关',
+    !KEYS.includes(status?.endpoint?.apiKey),
+    String(status?.endpoint?.apiKey),
+  );
+  check(
+    '/status 列出模型且都带 enabled 标记',
+    Array.isArray(status?.models) && status.models.length > 0 && status.models.every((m) => typeof m.enabled === 'boolean'),
+    JSON.stringify(status?.models?.slice(0, 2)),
+  );
 }
 
 globalThis.fetch = realFetch;

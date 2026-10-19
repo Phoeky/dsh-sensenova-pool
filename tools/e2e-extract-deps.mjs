@@ -73,5 +73,31 @@ for (const f of files) {
 }
 fs.closeSync(fd);
 
+// ---- 让插件的 lib/ 也能解析到这些包 ----------------------------------------
+//
+// `lib/index.js` 里 `import '@deepseek-ai/schemastery'` 是按**仓库根**的
+// node_modules 解析的，而提取结果在 `_e2e/node_modules`。只提取不映射时，文档里
+// 那条 `node --import ./tools/e2e-loader.mjs ...` 会以 ERR_MODULE_NOT_FOUND 失败。
+//
+// 这里为每个提取出来的 @deepseek-ai 包建一个目录联接（Windows junction，不需要
+// 管理员权限）。已存在的跳过，绝不覆盖用户自己装的东西。
+const scoped = path.join(outRoot, '@deepseek-ai');
+const repoScoped = path.join(repoRoot, 'node_modules', '@deepseek-ai');
+let linked = 0;
+if (fs.existsSync(scoped)) {
+  fs.mkdirSync(repoScoped, { recursive: true });
+  for (const name of fs.readdirSync(scoped)) {
+    const dest = path.join(repoScoped, name);
+    if (fs.existsSync(dest)) continue;
+    try {
+      fs.symlinkSync(path.join(scoped, name), dest, 'junction');
+      linked += 1;
+    } catch (error) {
+      console.warn(`  跳过 ${name}（建链接失败：${error.message}）`);
+    }
+  }
+}
+
 console.log(`已提取 ${count} 个文件 -> ${outRoot}`);
+if (linked > 0) console.log(`已链接 ${linked} 个包到 node_modules/@deepseek-ai`);
 console.log('现在可以运行：node --import ./tools/e2e-loader.mjs tools/e2e-real-credentials.mjs');

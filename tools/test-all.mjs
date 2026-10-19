@@ -27,6 +27,7 @@ const SUITES = [
   { name: '启动期凭据竞态（issue #1）', file: 'test-credentials-race.mjs', args: ['--import', './tools/stub-loader.mjs'] },
   { name: 'Web 路由与令牌', file: 'test-routes.mjs', args: [] },
   { name: '浏览器半契约', file: 'test-client.mjs', args: [] },
+  { name: '浏览器半渲染冒烟', file: 'test-client-render.mjs', args: [] },
 ];
 
 let failed = 0;

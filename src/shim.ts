@@ -81,7 +81,16 @@ export interface ShimOptions {
 export interface Shim {
   ready: Promise<void>;
   baseUrl(): string;
+  port(): number;
+  /** 当前对外暴露的 API Key（DSH 自己也用它访问本服务）。 */
   token(): string;
+  /**
+   * 换一把对外密钥。
+   *
+   * 旧密钥**继续接受**：pi-ai 可能缓存了 `resolveApiKey` 的结果，切换瞬间在途的
+   * 请求不该因此 401。持久化的密钥在启动装载完成后才拿到，正是走这条路径。
+   */
+  setToken(next: string): void;
   close(): Promise<void>;
 }
 
@@ -96,7 +105,11 @@ export function createShim(options: ShimOptions): Shim {
   const { pool, catalog } = options;
   const rotation: RotationOptions = { ...DEFAULT_ROTATION, ...options.rotation };
   // 每进程随机共享密钥：DSH 用 Bearer 带上它，别的本地进程猜不到。
-  const sharedSecret = randomBytes(32).toString('base64url');
+  // 启动装载完成后会被凭据库里那把持久化密钥替换（见 setToken），以便外部服务
+  // 配置一次就能长期使用。
+  let primaryToken = randomBytes(24).toString('base64url');
+  /** 仍被接受的密钥集合：切换后旧值保留，避免在途请求被 401。 */
+  const acceptedTokens = new Set<string>([primaryToken]);
 
   const server: Server = createServer((req, res) => {
     void handle(req, res);
@@ -107,13 +120,15 @@ export function createShim(options: ShimOptions): Shim {
   });
   server.listen(0, '127.0.0.1');
 
-  const baseUrl = (): string => {
+  const listeningAddress = (): { port: number } => {
     const address = server.address();
     if (address === null || typeof address === 'string') {
       throw new Error('sensenova-pool shim has no listening address');
     }
-    return `http://127.0.0.1:${address.port}`;
+    return address;
   };
+
+  const baseUrl = (): string => `http://127.0.0.1:${listeningAddress().port}`;
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     try {
@@ -267,7 +282,21 @@ export function createShim(options: ShimOptions): Shim {
   return {
     ready,
     baseUrl,
-    token: () => sharedSecret,
+    port: () => listeningAddress().port,
+    token: () => primaryToken,
+    setToken: (next: string) => {
+      if (typeof next !== 'string' || next.length < 8 || next === primaryToken) return;
+      primaryToken = next;
+      acceptedTokens.add(next);
+      // 只留最近两把：换密钥不常发生，但别让集合无限增长。
+      if (acceptedTokens.size > 2) {
+        for (const token of acceptedTokens) {
+          if (token === primaryToken) continue;
+          acceptedTokens.delete(token);
+          break;
+        }
+      }
+    },
     close: async () => {
       await new Promise<void>((resolve) => {
         server.close(() => resolve());
@@ -283,10 +312,15 @@ export function createShim(options: ShimOptions): Shim {
     if (typeof header !== 'string') return false;
     const match = /^Bearer\s+(.+)$/i.exec(header.trim());
     if (!match) return false;
-    const a = Buffer.from(match[1]);
-    const b = Buffer.from(sharedSecret);
-    if (a.length !== b.length) return false;
-    return timingSafeEqual(a, b);
+    const presented = Buffer.from(match[1]);
+    let ok = false;
+    // 逐个常量时间比较：命中哪一把都不提前返回，避免从耗时推断密钥。
+    for (const token of acceptedTokens) {
+      const expected = Buffer.from(token);
+      if (expected.length !== presented.length) continue;
+      if (timingSafeEqual(presented, expected)) ok = true;
+    }
+    return ok;
   }
 }
 

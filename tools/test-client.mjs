@@ -36,11 +36,22 @@ check('未使用 setTimeout（动态包禁止）', !/(^|[^.\w])setTimeout\s*\(/m
 console.log('\n[client] 槽位与文案');
 check('注册 plugins.bundle.config（现行槽位）', code.includes("'plugins.bundle.config'"));
 check('key 等于包名', code.includes(`key: BUNDLE_NAME`) || code.includes(`key: '${pkg.name}'`));
+check('注册 settings.section（设置一级分区）', code.includes("'settings.section'"));
+check('设置分区带 id', /name:\s*'settings\.section'[\s\S]{0,200}?id:\s*'sensenova-pool'/.test(code));
+check('设置分区带 order 与 label', /name:\s*'settings\.section'[\s\S]{0,300}?order:\s*\d+[\s\S]{0,200}?label:/.test(code));
 check('注册 locale 字典', code.includes('locale.register'));
 check('含中文文案', code.includes('商汤日日新'));
 check('含英文文案', code.includes('SenseNova Key Pool'));
 check('有错误隔离（guardClientContribution）', code.includes('guardClientContribution'));
 check('用主题 token 而非硬编码颜色', code.includes('--dsw-alias-'));
+
+console.log('\n[client] 新增功能面');
+check('展示接口地址', code.includes('endpoint.baseUrl'));
+check('展示对外 API Key', code.includes('endpoint.apiKey'));
+check('栏目名用包名', code.includes('label: () => BUNDLE_NAME'));
+check('提供复制能力', code.includes('copyText'));
+check('模型可见性开关（set-model）', code.includes("action: 'set-model'"));
+check('模型列表来自 /status', code.includes('status.models'));
 
 console.log('\n[client] 与宿主路由的契约');
 // 客户端用 BASE 常量 + 后缀拼 URL（比散落的字面量更不易写错），因此这里

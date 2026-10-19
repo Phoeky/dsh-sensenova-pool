@@ -28,6 +28,16 @@ export interface StatusProvider {
   summary(): { total: number; healthy: number; cooldown: number; invalid: number; inflight: number };
   catalog(): { source: string; count: number; fetchedAt: number; error: string };
   rotations(): Array<{ keyId: string; kind: string; status: number; message: string; at: number }>;
+  /** 本地 shim 的对外接入信息（地址、端口、API Key）。 */
+  endpoint(): { baseUrl: string; port: number; apiKey: string };
+  /** 目录里的全部模型 + 是否在下拉中展示。 */
+  models(): Array<{
+    id: string;
+    name: string;
+    contextWindow: number;
+    maxTokens: number;
+    enabled: boolean;
+  }>;
   providerId: string;
   providerName: string;
   baseUrl: string;
@@ -45,6 +55,8 @@ export interface RouteDeps {
   logger: Logger;
   /** key 列表发生变更后回调（持久化 + 刷新目录）。 */
   onKeysChanged(): Promise<void>;
+  /** 模型可见性发生变更后回调（收到完整的「被隐藏」列表）。 */
+  onModelsChanged(disabled: string[]): Promise<void>;
   /** 重新从凭据库装载。 */
   reload(): Promise<void>;
   /** 主动拉取上游模型目录。 */
@@ -184,8 +196,11 @@ export function registerKeyRoutes(ctx: any, deps: RouteDeps): void {
         provider: deps.status.providerId,
         displayName: deps.status.providerName,
         baseUrl: deps.status.baseUrl,
+        // 对外接入信息：地址 / 端口 / API Key，供卡片展示并可复制到别的服务。
+        endpoint: deps.status.endpoint(),
         summary: deps.status.summary(),
         catalog: deps.status.catalog(),
+        models: deps.status.models(),
         rotations: deps.status.rotations(),
         // 卡片靠这一份数据渲染列表，并从响应里取写令牌（同源页面才拿得到）。
         keys: deps.status.pool(),
@@ -243,6 +258,30 @@ export function registerKeyRoutes(ctx: any, deps: RouteDeps): void {
           deps.pool.clear();
           await deps.onKeysChanged();
           sendJson(res, 200, { cleared: true, total: 0, keys: [] });
+          return;
+        }
+
+        // ---- 模型可见性：切换单个模型是否出现在模型选择器里 ----------------
+        //
+        // 一次只改一个：界面是勾选框，逐项切换最贴合操作，也避免「整表覆盖」
+        // 在并发点击时互相抹掉。
+        if (action === 'set-model') {
+          const id = typeof body?.id === 'string' ? body.id : '';
+          if (!id) {
+            sendJson(res, 400, { error: '缺少模型 id' });
+            return;
+          }
+          const all = deps.status.models();
+          if (!all.some((model) => model.id === id)) {
+            sendJson(res, 404, { error: `未知模型：${id}` });
+            return;
+          }
+          const enabled = body?.enabled !== false;
+          const nextDisabled = all
+            .filter((model) => (model.id === id ? !enabled : !model.enabled))
+            .map((model) => model.id);
+          await deps.onModelsChanged(nextDisabled);
+          sendJson(res, 200, { id, enabled, models: deps.status.models() });
           return;
         }
 
