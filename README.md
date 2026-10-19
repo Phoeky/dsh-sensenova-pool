@@ -45,7 +45,7 @@
 - 池子真的耗尽时，回报 `503 + Retry-After`（而不是 429），交由 DSH 自行退避重试
 - 429 计数与冷却状态在卡片上实时可见
 
-截图中的 `3/9 成功，6 次限流` 就是真实发生的记录：这把 Key 触发了 6 次 429，全部被池子内部消化，上层没有收到过一个 429。
+截图里的 `2/3 成功，1 次限流` 是真实发生的记录：这把 Key 触发过 1 次 429，被池子内部消化掉，上层没有收到过任何 429。
 
 ### 🧠 一次接入全部模型
 
@@ -75,7 +75,7 @@ Key 存在 DSH 的凭据库里，不写进任何配置文件。填入即生效�
 
 ### 🔌 提供对外的 OpenAI 兼容接口
 
-插件在 127.0.0.1 上起一个 OpenAI 兼容服务。设置页显示接口地址、端口和 API Key，复制后填进其他 Agent 或客户端即可使用；请求共用同一个 Key 池，遇到限流同样自动换 Key。
+插件在 127.0.0.1 上起一个 OpenAI 兼容服务。设置页显示接口地址和 API Key，复制后填进其他 Agent 或客户端即可使用；请求共用同一个 Key 池，遇到限流同样自动换 Key。
 
 ```bash
 curl http://127.0.0.1:51234/v1/chat/completions \
@@ -90,6 +90,8 @@ curl http://127.0.0.1:51234/v1/chat/completions \
 ### 🎛 管理可选择模型
 
 设置页列出目录里的全部模型。取消勾选的模型不再注册给 provider，也就不会出现在模型选择器里，这个选择重启后保留。套餐里不含某些模型时，可以在这里把它们关掉。
+
+![模型可见性](https://raw.githubusercontent.com/Phoeky/dsh-sensenova-pool/main/docs/shots/02-models.png)
 
 ---
 
@@ -139,7 +141,7 @@ pnpm --dir "$DSH_PROFILE_DIR" add "link:$PWD"
 
 改完 `package.json` 后**重启 DeepSeek Harness**。确认安装成功：插件页的「已安装」列表里会出现本插件。
 
-![插件页](https://raw.githubusercontent.com/Phoeky/dsh-sensenova-pool/main/docs/shots/02-installed.png)
+![插件页](https://raw.githubusercontent.com/Phoeky/dsh-sensenova-pool/main/docs/shots/03-installed.png)
 
 ---
 
