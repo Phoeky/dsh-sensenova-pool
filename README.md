@@ -264,6 +264,38 @@ records:
 如果你还在旧版本上遇到，升级即可，不需要重新填 Key（Key 一直好好地在
 `$DSH_HOME/.credentials.yaml` 里）。临时办法是在插件卡片上点一次「刷新/重载」。
 
+**报 `400 inference request is invalid` / `400 invalid arguments`？**
+
+这是 **商汤网关的 schema 校验**比 OpenAI 官方严导致的，不是 Key 无效，也不是限流——
+换 Key 完全没用。Agent（DSH 的 pi-ai 层）会按 OpenAI 规范发出一些「官方接受、商汤不认」
+的写法：
+
+| 请求体写法 | 商汤 `deepseek-v4-flash` | 说明 |
+|---|---|---|
+| `{"role":"developer","content":"…"}` | ❌ 400 | OpenAI 新规范里替代 `system` 的角色，商汤只认 `system` |
+| `{"role":"assistant","content":null}`（无 `tool_calls`） | ❌ 400 | 表示「这一轮只有工具调用」的常规写法 |
+| `{"role":"system","content":null}` / `{"role":"tool","content":null}` | ❌ 400 | 工具结果为空时很常见 |
+| `tool_calls[*].function.arguments` 传**对象** | ❌ 400 `invalid arguments` | 必须是 JSON 字符串 |
+| `content` 传数字（`123`） | ❌ 400 `invalid arguments` | 必须是字符串或数组 |
+| `temperature` 等传字符串（`"0.7"`） | ❌ 400 `invalid arguments` | 必须是数字 |
+| `logprobs` / `top_logprobs` / `metadata` | ❌ 400 | 商汤不支持这些字段 |
+| `reasoning_effort` 传 `off` | ❌ 400 `field ReasoningEffort invalid` | 合法值只有 `none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`（`off` 要翻成 `none`） |
+
+**0.2.1 已修复**：shim 在转发前会把这些写法**语义等价**地规范成商汤接受的形式
+（`developer`→`system`、`null`/缺失的 content→`""`、`arguments` 对象→JSON 字符串、
+数值字符串→数字、`off`→`none`、摘掉不支持字段），
+**你不需要改任何配置**。带 `tool_calls` 的 `content: null` 会**保持原样**（商汤接受，动它反而有风险）。
+
+> 特别说明：`max` 与 `minimal` **本来就是合法档位**（上游报错原文列全了它们），
+> 所以不会被改动或降级 —— 否则会悄悄改掉你要求的推理强度。
+
+刻意不代改的三类（改了只会把错误往后推）：`user.content` 为空、数值**越界**
+（如 `temperature: 3`）、未知 role。
+
+> 💡 如果升级后仍报 400，说明是清洗层还没覆盖的新写法。此时把
+> `debugRequestOn400` 打开，插件的 400 日志里会**直接打出实际发出的请求体**，
+> 一眼就能定位是哪个字段——不用再猜。相关讨论见 [issue #2](https://github.com/Phoeky/dsh-sensenova-pool/issues/2)。
+
 **Key 会泄漏吗？**
 
 不会。界面只显示掩码；明文只存在 DSH 凭据库（`$DSH_HOME/.credentials.yaml`）中，不会写入任何配置文件，也不会出现在日志里。

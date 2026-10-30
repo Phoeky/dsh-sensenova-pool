@@ -24,6 +24,7 @@ import { Readable } from 'node:stream';
 import { BUILTIN_MODELS, DEFAULT_BASE_URL, parseModelCatalog, type SenseNovaModel } from './catalog.js';
 import { KeyPool } from './keypool.js';
 import { DEFAULT_ROTATION, requestWithRotation, type AttemptLog, type RotationOptions } from './rotate.js';
+import { sanitizeChatRequest } from './sanitize.js';
 
 // --------------------------------------------------------------------- 目录
 
@@ -76,6 +77,14 @@ export interface ShimOptions {
   logger?: { info(msg: string): void; warn(msg: string): void; error(msg: string): void };
   /** 每次因 429/网络原因切换 key 时回调，供 UI 展示。 */
   onAttemptFailed?: (log: AttemptLog) => void;
+  /**
+   * 上游返回 400 时，把**实际发出去的请求体**记进日志。
+   *
+   * 商汤的 400 只回一句 `inference request is invalid`，不告诉你是哪个字段、
+   * 也不回显请求体；历史上排查这类问题只能靠猜字段，效率极低。记录原始请求体后
+   * 一眼就能定位。默认关闭（体积大且可能含用户内容），由 e2e / 排障时显式打开。
+   */
+  debugRequestOn400?: boolean;
 }
 
 export interface Shim {
@@ -186,6 +195,16 @@ export function createShim(options: ShimOptions): Shim {
       return;
     }
 
+    // 关键：转发前把「Agent 合法、商汤不认」的写法规范成等价安全写法。
+    // pi-ai 完全按 OpenAI 规范构造请求，其中一批写法（developer 角色、
+    // content:null、arguments 传对象、reasoning_effort 的 off/max…）会在商汤
+    // 网关撞 400，而换 key 是解不开的 —— 必须在这里就地修好再发。
+    const { body: sanitized, changes } = sanitizeChatRequest(body);
+    const forwardBody = changes.length > 0 ? JSON.stringify(sanitized) : raw;
+    if (changes.length > 0) {
+      options.logger?.info(`sensenova-pool: 已规范化请求体字段 ${changes.join(', ')}`);
+    }
+
     const wantsStream = body.stream === true;
     const upstreamUrl = `${options.baseUrl.replace(/\/+$/, '')}/chat/completions`;
 
@@ -204,7 +223,7 @@ export function createShim(options: ShimOptions): Shim {
             authorization: `Bearer ${apiKey}`,
             accept: wantsStream ? 'text/event-stream' : 'application/json',
           },
-          body: raw,
+          body: forwardBody,
           signal,
         }),
       {
@@ -224,6 +243,14 @@ export function createShim(options: ShimOptions): Shim {
         if (!res.headersSent) res.statusCode = 499;
         res.end();
         return;
+      }
+      // 400 是「请求体」问题，换 key 无解，也最难排查：商汤不回显请求体、
+      // 只回一句 inference request is invalid。排障时打开 debugRequestOn400，
+      // 直接把实际发出去的 body 落日志，省掉一轮轮猜字段。
+      if (options.debugRequestOn400 && result.error.status === 400) {
+        options.logger?.warn(
+          `sensenova-pool: 上游 400（${result.error.message}），实际发出的请求体：${forwardBody}`,
+        );
       }
       writeError(
         res,

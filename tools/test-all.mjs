@@ -22,6 +22,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const SUITES = [
   { name: 'key 轮换池逻辑', file: 'test-rotate.mjs', args: [] },
   { name: '回环 shim 协议', file: 'test-shim.mjs', args: [] },
+  { name: '请求体清洗（issue #2）', file: 'test-sanitize.mjs', args: [] },
   { name: 'apply() 启动时序', file: 'test-apply.mjs', args: ['--import', './tools/stub-loader.mjs'] },
   { name: '凭据记录 schema', file: 'test-credentials-record.mjs', args: ['--import', './tools/stub-loader.mjs'] },
   { name: '启动期凭据竞态（issue #1）', file: 'test-credentials-race.mjs', args: ['--import', './tools/stub-loader.mjs'] },
