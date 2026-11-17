@@ -30,12 +30,17 @@ export interface StatusProvider {
   rotations(): Array<{ keyId: string; kind: string; status: number; message: string; at: number }>;
   /** 本地 shim 的对外接入信息（地址、端口、API Key）。 */
   endpoint(): { baseUrl: string; port: number; apiKey: string };
-  /** 目录里的全部模型 + 是否在下拉中展示。 */
+  /** 目录里的全部模型 + 是否在下拉中展示 + 生效的窗口/输出上限。 */
   models(): Array<{
     id: string;
     name: string;
+    /** 生效值（含用户在设置页里的覆盖）。 */
     contextWindow: number;
     maxTokens: number;
+    /** 目录给出的默认值（可能已被基线覆盖上游），供「恢复默认」与占位提示。 */
+    defaults: { contextWindow: number; maxTokens: number };
+    /** 是否被用户自定义覆盖。 */
+    overridden: boolean;
     enabled: boolean;
   }>;
   providerId: string;
@@ -57,6 +62,8 @@ export interface RouteDeps {
   onKeysChanged(): Promise<void>;
   /** 模型可见性发生变更后回调（收到完整的「被隐藏」列表）。 */
   onModelsChanged(disabled: string[]): Promise<void>;
+  /** 某个模型的窗口/输出上限发生变更；两字段都缺省表示恢复默认。 */
+  onModelLimitsChanged(id: string, limits: { contextWindow?: number; maxTokens?: number }): Promise<void>;
   /** 重新从凭据库装载。 */
   reload(): Promise<void>;
   /** 主动拉取上游模型目录。 */
@@ -83,6 +90,38 @@ function loopbackRequest(req: any): boolean {
   } catch {
     return false;
   }
+}
+
+/** 简写单位：K = 1024、M = 1024²（与宿主模型配置页的 `1M` / `128K` 一致）。 */
+const SIZE_UNITS: Readonly<Record<string, number>> = { k: 1024, m: 1048576 };
+
+/**
+ * 解析界面传来的窗口/输出上限。
+ *
+ * 接受纯数字，也接受 `1M` / `128K` 这种简写：大小写与空格随意（`1M`、`1m`、
+ * ` 128 K `），支持小数（`1.5M` = 1,572,864）。空值表示「恢复默认」。
+ * 其余一律非法 —— 宁可让界面收到 400，也不要把一个奇怪的值写进记录。
+ */
+function parseLimit(raw: unknown): number | undefined | 'invalid' {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw === 'number') {
+    return Number.isFinite(raw) && Number.isInteger(raw) && raw > 0 ? raw : 'invalid';
+  }
+  if (typeof raw !== 'string') return 'invalid';
+
+  const text = raw.trim();
+  if (text === '') return undefined;
+
+  const match = /^(\d+(?:\.\d+)?)\s*([kKmM]?)$/.exec(text);
+  if (match === null) return 'invalid';
+
+  const base = Number(match[1]);
+  const unit = (match[2] ?? '').toLowerCase();
+  const multiplier = unit === '' ? 1 : SIZE_UNITS[unit];
+  if (!Number.isFinite(base) || base <= 0 || multiplier === undefined) return 'invalid';
+
+  const value = Math.round(base * multiplier);
+  return Number.isInteger(value) && value > 0 ? value : 'invalid';
 }
 
 function sendJson(res: any, status: number, payload: unknown): void {
@@ -282,6 +321,50 @@ export function registerKeyRoutes(ctx: any, deps: RouteDeps): void {
             .map((model) => model.id);
           await deps.onModelsChanged(nextDisabled);
           sendJson(res, 200, { id, enabled, models: deps.status.models() });
+          return;
+        }
+
+        // ---- 模型的窗口 / 输出上限：让用户能覆盖上游的元数据 -------------
+        //
+        // 上游 /v1/models 的 context_length 不一定可信（issue #4 实测到把
+        // sensenova-6.8-flash 报小 4 倍）。基线只能覆盖我们实测过的模型，剩下的
+        // 交给用户自己的判断：这里保存「每个模型的窗口与输出上限」。
+        //
+        // 归一规则：字段留空、或与目录默认值相同 → 视为恢复默认（不存覆盖）。
+        if (action === 'set-model-limits') {
+          const id = typeof body?.id === 'string' ? body.id : '';
+          if (!id) {
+            sendJson(res, 400, { error: '缺少模型 id' });
+            return;
+          }
+          const target = deps.status.models().find((model) => model.id === id);
+          if (target === undefined) {
+            sendJson(res, 404, { error: `未知模型：${id}` });
+            return;
+          }
+
+          const contextWindow = parseLimit(body?.contextWindow);
+          const maxTokens = parseLimit(body?.maxTokens);
+          if (contextWindow === 'invalid' || maxTokens === 'invalid') {
+            sendJson(res, 400, { error: '上下文窗口与最大输出必须是正整数，可写 1M / 128K（留空表示恢复默认）' });
+            return;
+          }
+          if (contextWindow !== undefined && contextWindow < 1024) {
+            sendJson(res, 400, { error: '上下文窗口至少 1024' });
+            return;
+          }
+
+          const effectiveWindow = contextWindow ?? target.defaults.contextWindow;
+          if (maxTokens !== undefined && maxTokens >= effectiveWindow) {
+            sendJson(res, 400, { error: '最大输出必须小于上下文窗口' });
+            return;
+          }
+
+          await deps.onModelLimitsChanged(id, {
+            contextWindow: contextWindow === target.defaults.contextWindow ? undefined : contextWindow,
+            maxTokens: maxTokens === target.defaults.maxTokens ? undefined : maxTokens,
+          });
+          sendJson(res, 200, { id, models: deps.status.models() });
           return;
         }
 

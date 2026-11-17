@@ -59,9 +59,15 @@
 | `deepseek-flash` | 1,048,576 | 65,536 | – |
 | `glm-5.2` | 1,048,576 | 131,072 | – |
 | `kimi-k3` | 1,048,576 | 65,536 | – |
+| `sensenova-6.8-flash` | 1,048,576 | 65,536 | ✓ |
 | `sensenova-6.8-flash-lite` | 262,144 | 65,536 | ✓ |
 
 启动时内置一份保守目录（无需网络即可用），拿到有效 Key 后自动通过 `/v1/models` 刷新，**商汤日后上线新模型无需升级插件**。
+
+> ⚠️ 上游 `/v1/models` 的 `context_length` **不一定可信**：它把 `sensenova-6.8-flash` 报成 262,144，
+> 而实测（2026-11-17 直连上游逐级加压）**1,047,536 tokens 仍 200、约 1.05M 才 400** —— 真实窗口就是
+> 1,048,576，被报小了 4 倍。对这类已实测的模型，插件用基线**覆盖**上游值；对照组 `flash-lite` 的
+> 262,144 是真值（257,013 通过、275K 档 400），保持不动。其余模型仍以上游为准，不影响「新模型无需改代码」。
 
 思考等级同样支持，且**档位按模型自动适配**：`glm-5.3` 只认 `low / high / max`，`glm-5.2` 七档全收，缺档时自动就近归位而不是撞 400（见下文「思考档位按模型映射」）。
 
@@ -72,6 +78,10 @@ Key 存在 DSH 的凭据库里，不写进任何配置文件。填入即生效�
 ### 🧩 在 DSH 设置里管理
 
 设置侧栏新增 `dsh-sensenova-pool` 分区，Key 池、对外接口、模型可见性都在这一页。插件页里的卡片同样可以打开。
+
+每个模型的**上下文窗口**与**最大输出**都能改：点模型行右侧的「设置」，在展开的面板里填写后点「保存」才生效
+（`取消` 丢弃草稿，`恢复默认` 清掉覆盖）。输入框接受 `1M` / `128K` 这种简写，也接受精确数字。
+上游对个别模型会报小窗口，基线只覆盖了我们实测过的那些；其余的可以按你自己的实测或套餐情况修正。
 
 ### 🔌 提供对外的 OpenAI 兼容接口
 
@@ -281,6 +291,7 @@ records:
 | `logprobs` / `top_logprobs` / `metadata` | ❌ 400 | 商汤不支持这些字段 |
 | `reasoning_effort` 传 `off` | ❌ 400 `field ReasoningEffort invalid` | DSH 的 `off` 商汤拼作 `none` |
 | `reasoning_effort` 传**该模型不认的档位**（如 `glm-5.3` 收到 `xhigh`） | ❌ 400 `field ReasoningEffort invalid` | 合法词表**按模型**判定，见下方「思考档位按模型映射」 |
+| 给 `kimi-k3` 传任何非 `1` 的 `temperature` | ❌ 400 `field Temperature invalid, only 1 is allowed` | 该模型没有可调随机性；shim 会在转发前把它归一到 `1` |
 
 **0.2.1 已修复**：shim 在转发前会把这些写法**语义等价**地规范成商汤接受的形式
 （`developer`→`system`、`null`/缺失的 content→`""`、`arguments` 对象→JSON 字符串、
@@ -355,6 +366,12 @@ shim 侧另有一层兜底：万一别的客户端（或旧配置）发来该模
 - **[corrinehu/dsh-workbuddy-connect](https://github.com/corrinehu/dsh-workbuddy-connect)** —— 将第三方模型接入 DSH 的插件范式。本插件的 provider 注册方式与浏览器卡片结构参考了该项目。
 - **[Phoeky/st-rotator](https://github.com/Phoeky/st-rotator)** —— 商汤 Key 轮换网关。本插件的轮换调度、冷却退避与本地预限流策略参考了该项目。
 
+特别感谢以下朋友反馈问题、提供实测数据，其中好几处结论直接改变了实现方向：
+
+- **@Drhusku** —— [issue #1](https://github.com/Phoeky/dsh-sensenova-pool/issues/1) 启动期凭据竞态、[issue #4](https://github.com/Phoeky/dsh-sensenova-pool/issues/4) 上游把 `sensenova-6.8-flash` 的 1M 窗口谎报成 262144（还附了逐级加压的实测表，让"该不该覆盖上游"这件事有据可依）。
+- **@Sumtenm** —— [issue #3](https://github.com/Phoeky/dsh-sensenova-pool/issues/3) 逐个模型逐个档位实测出 `reasoning_effort` 的词表差异，直接促成了"按模型维护词表"这一版重构。
+- **@Mahiro-FT** —— [issue #2](https://github.com/Phoeky/dsh-sensenova-pool/issues/2) 最先报出 400，并配合确认了复现路径。
+
 ---
 
 ## 许可
@@ -408,6 +425,12 @@ Upgrade and your keys will be picked up again; they were never lost (they live i
 
 - [corrinehu/dsh-workbuddy-connect](https://github.com/corrinehu/dsh-workbuddy-connect) — the plugin pattern for bringing third-party models into DSH
 - [Phoeky/st-rotator](https://github.com/Phoeky/st-rotator) — the SenseNova key-rotation gateway this plugin's rotation strategy derives from
+
+Thanks to everyone who reported issues and shared measured data — several conclusions came straight from these reports:
+
+- **@Drhusku** — [issue #1](https://github.com/Phoeky/dsh-sensenova-pool/issues/1) credential race at startup; [issue #4](https://github.com/Phoeky/dsh-sensenova-pool/issues/4) upstream under-reporting `sensenova-6.8-flash`'s 1M window as 262144, with a full pressure-test table.
+- **@Sumtenm** — [issue #3](https://github.com/Phoeky/dsh-sensenova-pool/issues/3) per-model `reasoning_effort` vocabulary measurements that drove the per-model table rewrite.
+- **@Mahiro-FT** — [issue #2](https://github.com/Phoeky/dsh-sensenova-pool/issues/2) the first 400 report, plus reproduction follow-up.
 
 ### License
 

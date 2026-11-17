@@ -16,6 +16,16 @@ export interface SenseNovaModel {
   supportsImages: boolean;
   /** 是否为「只推理」模型（无法关闭思考）。 */
   reasoning: boolean;
+  /**
+   * 基线窗口是否**覆盖**上游 `/v1/models` 的 `context_length`（issue #4）。
+   *
+   * 只给「实测确认上游报小了」的模型打开；默认 false（以上游为准，保住「新模型
+   * 无需改代码」）。打开时必须在 {@link BUILTIN_MODELS} 的注释里写清实测依据与
+   * 日期 —— 上游一旦把真实上限调小，这类覆盖就会变成超窗错误（400/413）的来源。
+   *
+   * 用户在设置页里给某个模型自定义的窗口优先级更高，见 index.ts 的 modelLimits。
+   */
+  contextWindowOverridesUpstream?: boolean;
 }
 
 /**
@@ -33,6 +43,12 @@ export const BUILTIN_MODELS: readonly SenseNovaModel[] = [
   { id: 'deepseek-flash', name: 'DeepSeek Flash', contextWindow: 1048576, maxTokens: 65536, supportsImages: false, reasoning: true },
   { id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1048576, maxTokens: 131072, supportsImages: false, reasoning: true },
   { id: 'kimi-k3', name: 'Kimi K3', contextWindow: 1048576, maxTokens: 65536, supportsImages: false, reasoning: true },
+  // 上游 /v1/models 对它报 context_length=262144，实测约 1M：2026-11-17 直连
+  // 上游逐级加压，prompt_tokens=1,047,536 仍 200、≈1.05M 才 400 —— 边界正好落在
+  // 2^20（1,048,576）。必须盖掉上游值，否则整条链路（插件 → DSH → 压缩代理）
+  // 只按 256K 算，长会话在 20% 左右就开始压缩折叠（issue #4）。
+  { id: 'sensenova-6.8-flash', name: 'SenseNova 6.8 Flash', contextWindow: 1048576, maxTokens: 65536, supportsImages: true, reasoning: true, contextWindowOverridesUpstream: true },
+  // 对照组：同样报 262144，但实测 257,013 tokens 通过、275K 档就 400 —— 这是真值。
   { id: 'sensenova-6.8-flash-lite', name: 'SenseNova 6.8 Flash-Lite', contextWindow: 262144, maxTokens: 65536, supportsImages: true, reasoning: true },
 ];
 
@@ -247,6 +263,26 @@ export function coerceReasoningEffort(modelId: string | undefined, requested: st
   return { value: mapped, changed: mapped !== requested };
 }
 
+// --------------------------------------------------------- 模型的固定参数
+
+/**
+ * 某些模型的采样参数只有**唯一合法值**（2026-11-17 实测）。
+ *
+ * `kimi-k3` 收到 `temperature: 0`（或任何非 1 的值）直接 400：
+ * `field Temperature invalid, only 1 is allowed for this model` —— 它根本
+ * 不提供「调低随机性」这个能力。既然唯一能发的值就是 1，清洗层直接兜住，
+ * 比让整轮对话失败要好；这不是篡改意图（没有别的值可选）。
+ */
+export const MODEL_FIXED_PARAMS: Readonly<Record<string, { temperature?: number }>> = {
+  'kimi-k3': { temperature: 1 },
+};
+
+/** 该模型必须使用的固定采样参数；没有则返回 `undefined`。 */
+export function fixedParamsFor(modelId: string | undefined): { temperature?: number } | undefined {
+  const id = normalizeModelId(modelId);
+  return id === undefined ? undefined : MODEL_FIXED_PARAMS[id];
+}
+
 /** `/v1/models` 返回的条目形状（只声明用到的字段）。 */
 interface RawModelEntry {
   id?: unknown;
@@ -255,6 +291,25 @@ interface RawModelEntry {
   max_output_length?: unknown;
   input_modalities?: unknown;
   supported_features?: unknown;
+}
+
+/**
+ * 决定一个模型的上下文窗口：基线可覆盖上游（issue #4）。
+ *
+ * 上游的 `context_length` 大多数时候可信，但已经实测到它会把某个模型的窗口
+ * 报小 4 倍（`sensenova-6.8-flash`）。所以优先级是：
+ *
+ *     标了 `contextWindowOverridesUpstream` 的基线 > 上游 `context_length` > 基线 > 262144
+ *
+ * 只有**实测确认上游报小了**的模型才走第一档；其余（含新上架模型）继续以上游为准。
+ * 用户在设置页里给该模型自定义的值不在这里处理 —— 那是 index.ts 的 modelLimits，
+ * 优先级更高，因为它表达的是「用户自己的判断」。
+ */
+function resolveContextWindow(raw: RawModelEntry, baseline: SenseNovaModel | undefined): number {
+  const upstream =
+    typeof raw.context_length === 'number' && raw.context_length > 0 ? raw.context_length : undefined;
+  if (baseline?.contextWindowOverridesUpstream === true) return baseline.contextWindow;
+  return upstream ?? baseline?.contextWindow ?? 262144;
 }
 
 /**
@@ -280,10 +335,7 @@ export function parseModelCatalog(payload: unknown): SenseNovaModel[] {
     out.push({
       id,
       name: typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : id,
-      contextWindow:
-        typeof raw.context_length === 'number' && raw.context_length > 0
-          ? raw.context_length
-          : baseline?.contextWindow ?? 262144,
+      contextWindow: resolveContextWindow(raw, baseline),
       maxTokens:
         typeof raw.max_output_length === 'number' && raw.max_output_length > 0
           ? raw.max_output_length

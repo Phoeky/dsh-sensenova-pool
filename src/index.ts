@@ -159,6 +159,32 @@ export function apply(ctx: any, config: PluginConfig): void {
   const disabledModels = new Set<string>();
 
   /**
+   * 用户为单个模型自定义的窗口 / 输出上限。
+   *
+   * 为什么要让用户改：上游 `/v1/models` 的 `context_length` 不一定可信（issue #4
+   * 实测到 `sensenova-6.8-flash` 报小 4 倍），基线只能覆盖我们已经实测过的模型；
+   * 剩下那些「上游报了但我们没实测」的，交给用户自己的判断。
+   *
+   * 优先级：用户覆盖 > 目录值（目录值可能已被基线覆盖，见 catalog.ts）。
+   * 逐字段回退：只改窗口时，输出上限仍取目录值。
+   */
+  const modelLimits = new Map<string, { contextWindow?: number; maxTokens?: number }>();
+
+  /** 正整数校验（窗口/输出上限只接受正整数）。 */
+  function isPositiveInteger(value: unknown): value is number {
+    return typeof value === 'number' && Number.isInteger(value) && value > 0;
+  }
+
+  /** 该模型最终生效的窗口 / 输出上限。 */
+  function limitsFor(model: SenseNovaModel): { contextWindow: number; maxTokens: number } {
+    const override = modelLimits.get(model.id);
+    return {
+      contextWindow: override?.contextWindow ?? model.contextWindow,
+      maxTokens: override?.maxTokens ?? model.maxTokens,
+    };
+  }
+
+  /**
    * 对外暴露的 API Key（别的服务用它访问本地 shim）。
    *
    * 持久化在凭据记录里，重启后保持不变 —— 否则每次启动都换一把，外部服务就得
@@ -203,13 +229,20 @@ export function apply(ctx: any, config: PluginConfig): void {
       }
     },
     models: () =>
-      catalog.current().map((model) => ({
-        id: model.id,
-        name: model.name,
-        contextWindow: model.contextWindow,
-        maxTokens: model.maxTokens,
-        enabled: !disabledModels.has(model.id),
-      })),
+      catalog.current().map((model) => {
+        const limits = limitsFor(model);
+        return {
+          id: model.id,
+          name: model.name,
+          // 生效值（含用户覆盖），界面显示与模型注册都用它。
+          contextWindow: limits.contextWindow,
+          maxTokens: limits.maxTokens,
+          // 目录给出的默认值（可能已被基线覆盖上游），供「恢复默认」与占位提示。
+          defaults: { contextWindow: model.contextWindow, maxTokens: model.maxTokens },
+          overridden: modelLimits.has(model.id),
+          enabled: !disabledModels.has(model.id),
+        };
+      }),
     providerId: PROVIDER_ID,
     providerName: PROVIDER_NAME,
     baseUrl: resolved.baseUrl,
@@ -236,6 +269,8 @@ export function apply(ctx: any, config: PluginConfig): void {
     keys?: unknown;
     /** 被用户隐藏的模型 id（不进入模型选择器）。 */
     disabledModels?: unknown;
+    /** 用户自定义的窗口/输出上限：`{ [modelId]: { contextWindow?, maxTokens? } }`。 */
+    modelLimits?: unknown;
     /** 对外暴露给其他本地服务的 API Key。 */
     externalKey?: unknown;
   }
@@ -360,6 +395,20 @@ export function apply(ctx: any, config: PluginConfig): void {
       }
     }
 
+    // 模型窗口/输出上限的用户覆盖：坏条目跳过，不影响其它模型。
+    modelLimits.clear();
+    if (payload.modelLimits !== null && typeof payload.modelLimits === 'object') {
+      for (const [id, value] of Object.entries(payload.modelLimits as Record<string, unknown>)) {
+        if (typeof id !== 'string' || id.length === 0) continue;
+        if (value === null || typeof value !== 'object') continue;
+        const record = value as { contextWindow?: unknown; maxTokens?: unknown };
+        const limits: { contextWindow?: number; maxTokens?: number } = {};
+        if (isPositiveInteger(record.contextWindow)) limits.contextWindow = record.contextWindow;
+        if (isPositiveInteger(record.maxTokens)) limits.maxTokens = record.maxTokens;
+        if (limits.contextWindow !== undefined || limits.maxTokens !== undefined) modelLimits.set(id, limits);
+      }
+    }
+
     // 对外密钥：拿到持久化的那把后立刻换上，DSH 与外部服务从此用同一个。
     if (typeof payload.externalKey === 'string' && payload.externalKey.length >= 16) {
       externalKey = payload.externalKey;
@@ -411,6 +460,8 @@ export function apply(ctx: any, config: PluginConfig): void {
       payload: {
         keys: pool.keys(),
         disabledModels: [...disabledModels],
+        // 只存用户真正改过的模型；没有覆盖的模型不出现在这里。
+        modelLimits: Object.fromEntries(modelLimits),
         externalKey,
       },
     }));
@@ -457,8 +508,8 @@ export function apply(ctx: any, config: PluginConfig): void {
         reasoning: model.reasoning,
         ...(model.reasoning ? { thinkingLevelMap: thinkingLevelMapFor(model.id) } : {}),
         cost: NO_COST,
-        contextWindow: model.contextWindow,
-        maxTokens: model.maxTokens,
+        // 用户在设置页里的自定义值优先于目录值（issue #4：上游的 context_length 不一定可信）。
+        ...limitsFor(model),
         compat: { maxTokensField: 'max_tokens' },
       }));
   }
@@ -718,6 +769,26 @@ export function apply(ctx: any, config: PluginConfig): void {
     }
   };
 
+  /**
+   * 应用「某个模型的窗口 / 输出上限」的用户覆盖。
+   *
+   * 两个字段都缺省表示恢复默认（删除这条覆盖）。落盘失败不算失败：内存里已经
+   * 生效，下次写入会一并带上（与模型可见性同样的策略）。
+   */
+  const handleModelLimitsChanged = async (
+    id: string,
+    limits: { contextWindow?: number; maxTokens?: number },
+  ): Promise<void> => {
+    if (limits.contextWindow === undefined && limits.maxTokens === undefined) modelLimits.delete(id);
+    else modelLimits.set(id, { ...limits });
+    refreshCatalog();
+    try {
+      await saveKeys();
+    } catch (error) {
+      logger.warn(`模型窗口设置落盘失败（本次会话已生效）：${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
   // 设置页：填 key（用户明确要求只在设置页填）。
   try {
     registerSettingsSection(ctx, {
@@ -738,6 +809,7 @@ export function apply(ctx: any, config: PluginConfig): void {
       logger,
       onKeysChanged: handleKeysChanged,
       onModelsChanged: handleModelsChanged,
+      onModelLimitsChanged: handleModelLimitsChanged,
       reload: async () => {
         // 手动重载：走同一套「装载并宣告」逻辑，因此在启动早期点它也不会把
         // 「还没读到」误当成「真的没有 key」而清空权威装载信号。

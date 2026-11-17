@@ -184,6 +184,38 @@ console.log('\n[10] 目录解析：过滤图像生成模型，保留上下文窗
   check('内置基线非空', BUILTIN_MODELS.length > 0);
 }
 
+console.log('\n[10b] 窗口解析：基线可覆盖上游（issue #4）');
+{
+  const parsed = parseModelCatalog({
+    data: [
+      // 上游把 flash 的窗口报小了 4 倍；基线标了 override，所以以基线为准。
+      { id: 'sensenova-6.8-flash', context_length: 262144, max_output_length: 65536, input_modalities: ['text', 'image'], output_modalities: ['text'] },
+      // 对照：lite 的同名数值是真实值，基线没标 override，保持上游值。
+      { id: 'sensenova-6.8-flash-lite', context_length: 262144, max_output_length: 65536, input_modalities: ['text', 'image'], output_modalities: ['text'] },
+      // 未知模型：继续以上游为准，不受 override 机制影响。
+      { id: 'brand-new-model', context_length: 200000, max_output_length: 8192, input_modalities: ['text'], output_modalities: ['text'] },
+      // 上游缺字段：回落到基线（这里没有基线）→ 默认 262144。
+      { id: 'no-context-model', max_output_length: 8192, input_modalities: ['text'], output_modalities: ['text'] },
+    ],
+  });
+  const byId = new Map(parsed.map((m) => [m.id, m]));
+  check('flash 的 262144 被基线覆盖成 1048576',
+    byId.get('sensenova-6.8-flash')?.contextWindow === 1048576,
+    String(byId.get('sensenova-6.8-flash')?.contextWindow));
+  check('lite 保留上游的 262144（那是真值，不覆盖）',
+    byId.get('sensenova-6.8-flash-lite')?.contextWindow === 262144,
+    String(byId.get('sensenova-6.8-flash-lite')?.contextWindow));
+  check('未知模型以上游为准', byId.get('brand-new-model')?.contextWindow === 200000,
+    String(byId.get('brand-new-model')?.contextWindow));
+  check('上游缺 context_length 时回落默认 262144',
+    byId.get('no-context-model')?.contextWindow === 262144,
+    String(byId.get('no-context-model')?.contextWindow));
+  check('基线里 flash 标了 override 开关',
+    BUILTIN_MODELS.find((m) => m.id === 'sensenova-6.8-flash')?.contextWindowOverridesUpstream === true);
+  check('基线里 lite 没有 override 开关',
+    BUILTIN_MODELS.find((m) => m.id === 'sensenova-6.8-flash-lite')?.contextWindowOverridesUpstream !== true);
+}
+
 console.log('\n[11] 脱敏：日志里不出现完整 key');
 {
   const { maskKey } = await import('../lib/keypool.js');

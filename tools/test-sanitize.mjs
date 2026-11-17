@@ -156,6 +156,31 @@ console.log('\n[sanitize] reasoning_effort（issue #2 的怀疑点）');
   check('记录了改动', c5.includes('reasoning_effort'));
 }
 
+console.log('\n[sanitize] 模型的固定采样参数（issue #4 顺带发现）');
+{
+  // 实测：kimi-k3 收到 temperature 0 / 0.7 都会 400「only 1 is allowed」。
+  // 它没有第二个合法值，清洗层兜住才不会让整轮对话失败。
+  const { body, changes } = sanitize({ model: 'kimi-k3', temperature: 0 });
+  check('kimi-k3 的 temperature:0 → 1', body.temperature === 1, String(body.temperature));
+  check('记录了改动', changes.includes('temperature'));
+
+  const { body: b2, changes: c2 } = sanitize({ model: 'kimi-k3', temperature: 1 });
+  check('temperature:1 原样保留', b2.temperature === 1 && c2.length === 0, JSON.stringify(c2));
+
+  const { body: b3, changes: c3 } = sanitize({ model: 'glm-5.2', temperature: 0.2 });
+  check('其它模型的 temperature 不动', b3.temperature === 0.2 && c3.length === 0, String(b3.temperature));
+
+  const { body: b4 } = sanitize({ model: 'kimi-k3' });
+  check('没带 temperature 时不擅自加', !('temperature' in b4), JSON.stringify(b4.temperature));
+
+  const { body: b5 } = sanitize({ model: 'kimi-k3', temperature: '0.7' });
+  check('字符串温度先转数字再兜住', b5.temperature === 1, String(b5.temperature));
+
+  // 幂等：清洗过的请求再清洗一次不该有改动。
+  const again = sanitizeChatRequest({ ...BASE, model: 'kimi-k3', temperature: 1 });
+  check('kimi 温度清洗幂等', again.changes.length === 0, JSON.stringify(again.changes));
+}
+
 console.log('\n[sanitize] 组合与幂等');
 {
   const input = {

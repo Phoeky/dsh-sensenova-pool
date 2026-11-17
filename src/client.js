@@ -87,6 +87,46 @@ window.__ModuleLoader__.load({
       fontWeight: 500,
     };
     const smallButtonStyle = { ...buttonStyle, minHeight: 26, padding: '2px 10px', fontSize: 12 };
+    /** 模型能力编辑面板：展开在模型条目下方，点「保存」才生效。 */
+    const limitEditorStyle = {
+      display: 'grid',
+      gap: 4,
+      width: '100%',
+      paddingTop: 10,
+      marginTop: 2,
+      borderTop: `1px solid ${borderL2}`,
+    };
+    /** 字段名：参考宿主模型配置页的写法，label 在上、输入框在下。 */
+    const fieldLabelStyle = { fontSize: 12, color: labelSecondary, lineHeight: '18px' };
+    const fieldHintStyle = { margin: '0 0 6px', fontSize: 12, color: labelTertiary, lineHeight: '16px' };
+    const limitInputStyle = {
+      boxSizing: 'border-box',
+      width: '100%',
+      padding: '6px 8px',
+      border: `1px solid ${borderL2}`,
+      borderRadius: 8,
+      background: bgLayer1,
+      color: labelPrimary,
+      font: 'inherit',
+      fontSize: 13,
+      lineHeight: '20px',
+      outline: 'none',
+    };
+
+    /** 把 token 数写成紧凑形式（1048576 → 1M、131072 → 128K），与宿主风格一致。 */
+    const formatTokens = (value) => {
+      if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return '—';
+      if (value >= 1048576 && value % 1048576 === 0) return `${value / 1048576}M`;
+      if (value >= 1024 && value % 1024 === 0) return `${value / 1024}K`;
+      return String(value);
+    };
+
+    /** 提示用的默认值描述：`1M (1048576)`；紧凑写法已经等于原值时只写一个。 */
+    const describeTokens = (value) => {
+      const compact = formatTokens(value);
+      if (typeof value !== 'number' || !Number.isFinite(value)) return compact;
+      return compact === String(value) ? compact : `${compact} (${value})`;
+    };
     const rowStyle = {
       display: 'flex',
       alignItems: 'center',
@@ -225,6 +265,10 @@ window.__ModuleLoader__.load({
       const [adminKey, setAdminKey] = React.useState(undefined);
       const [tested, setTested] = React.useState({});
       const [copied, setCopied] = React.useState('');
+      // 正在编辑窗口/输出上限的模型 id 与草稿值（点「保存」才写回）。
+      const [limitEditing, setLimitEditing] = React.useState('');
+      const [limitWindow, setLimitWindow] = React.useState('');
+      const [limitOutput, setLimitOutput] = React.useState('');
 
       const load = React.useCallback(async () => {
         try {
@@ -303,6 +347,42 @@ window.__ModuleLoader__.load({
         run('model', async () => {
           await postJson(`${BASE}/keys`, { action: 'set-model', id, enabled }, adminKey);
           return enabled ? t('modelShown', { id }) : t('modelHidden', { id });
+        });
+
+      // 模型窗口/输出上限：点「设置」展开草稿，点「保存」才写回。
+      // 不做逐键提交 —— 数字输入的中间态（先删空再输入）不该打请求。
+      // 打开面板时用紧凑写法（1M / 128K），与宿主模型配置页一致；
+      // 用户也可以直接写精确数字，服务端两种都认。
+      const openLimits = (model) => {
+        setLimitEditing(model.id);
+        setLimitWindow(formatTokens(model.contextWindow));
+        setLimitOutput(formatTokens(model.maxTokens));
+      };
+
+      const closeLimits = () => {
+        setLimitEditing('');
+      };
+
+      const limitsPayload = (model, contextWindow, maxTokens) => ({
+        action: 'set-model-limits',
+        id: model.id,
+        contextWindow: String(contextWindow).trim(),
+        maxTokens: String(maxTokens).trim(),
+      });
+
+      const submitLimits = (model) =>
+        run('limits', async () => {
+          await postJson(`${BASE}/keys`, limitsPayload(model, limitWindow, limitOutput), adminKey);
+          closeLimits();
+          return t('limitsSaved', { id: model.id });
+        });
+
+      const resetLimits = (model) =>
+        run('limits', async () => {
+          // 两个字段传空 = 恢复默认（服务端会归一成「不存覆盖」）。
+          await postJson(`${BASE}/keys`, limitsPayload(model, '', ''), adminKey);
+          closeLimits();
+          return t('limitsReset', { id: model.id });
         });
 
       const copy = async (field, text) => {
@@ -463,26 +543,88 @@ window.__ModuleLoader__.load({
                 models.map((model) =>
                   h(
                     'li',
-                    { key: model.id, style: { ...rowStyle, padding: '6px 10px' } },
-                    h(
-                      'label',
-                      { style: { display: 'flex', alignItems: 'center', gap: 10, flex: '1 1 auto', minWidth: 0, cursor: 'pointer' } },
-                      [
-                        h('input', {
-                          key: 'box',
-                          type: 'checkbox',
-                          checked: model.enabled === true,
-                          disabled: busy,
-                          onChange: (event) => toggleModel(model.id, event.target.checked),
-                        }),
-                        h(
-                          'span',
-                          { key: 'name', style: { fontSize: 13, color: model.enabled ? labelPrimary : labelTertiary, flex: '0 0 auto' } },
-                          model.name,
-                        ),
-                        h('span', { key: 'id', style: { ...codeStyle, flex: '1 1 auto', wordBreak: 'break-all' } }, model.id),
-                      ],
-                    ),
+                    { key: model.id, style: { ...rowStyle, padding: '6px 10px', flexWrap: 'wrap', rowGap: 6 } },
+                    [
+                      h(
+                        'div',
+                        { key: 'main', style: { display: 'flex', alignItems: 'center', gap: 10, width: '100%' } },
+                        [
+                          h(
+                            'label',
+                            { key: 'label', style: { display: 'flex', alignItems: 'center', gap: 10, flex: '1 1 auto', minWidth: 0, cursor: 'pointer' } },
+                            [
+                              h('input', {
+                                key: 'box',
+                                type: 'checkbox',
+                                checked: model.enabled === true,
+                                disabled: busy,
+                                onChange: (event) => toggleModel(model.id, event.target.checked),
+                              }),
+                              h(
+                                'span',
+                                { key: 'name', style: { fontSize: 13, color: model.enabled ? labelPrimary : labelTertiary, flex: '0 0 auto' } },
+                                model.name,
+                              ),
+                              h('span', { key: 'id', style: { ...codeStyle, flex: '1 1 auto', wordBreak: 'break-all' } }, model.id),
+                            ],
+                          ),
+                          model.overridden === true
+                            ? h('span', { key: 'badge', style: { ...hintStyle, color: labelSecondary, flex: '0 0 auto' } }, t('limitsCustom'))
+                            : null,
+                          // 窗口/最大输出不进主行：点「设置」展开面板，保存后才生效（issue #4）。
+                          h(
+                            'button',
+                            {
+                              key: 'edit',
+                              type: 'button',
+                              style: { ...smallButtonStyle, flex: '0 0 auto' },
+                              disabled: busy,
+                              onClick: () => (limitEditing === model.id ? closeLimits() : openLimits(model)),
+                            },
+                            t('limitsEdit'),
+                          ),
+                        ],
+                      ),
+                      limitEditing === model.id
+                        ? h(
+                            'div',
+                            { key: 'editor', style: limitEditorStyle },
+                            [
+                              h('label', { key: 'cwLabel', style: fieldLabelStyle }, t('limitsWindow')),
+                              h('input', {
+                                key: 'cw',
+                                type: 'text',
+                                inputMode: 'numeric',
+                                value: limitWindow,
+                                placeholder: formatTokens(model.defaults?.contextWindow),
+                                disabled: busy,
+                                style: limitInputStyle,
+                                onChange: (event) => setLimitWindow(event.target.value),
+                              }),
+                              h('p', { key: 'cwHint', style: fieldHintStyle },
+                                t('limitsDefaultHint', { value: describeTokens(model.defaults?.contextWindow) })),
+                              h('label', { key: 'mtLabel', style: fieldLabelStyle }, t('limitsOutput')),
+                              h('input', {
+                                key: 'mt',
+                                type: 'text',
+                                inputMode: 'numeric',
+                                value: limitOutput,
+                                placeholder: formatTokens(model.defaults?.maxTokens),
+                                disabled: busy,
+                                style: limitInputStyle,
+                                onChange: (event) => setLimitOutput(event.target.value),
+                              }),
+                              h('p', { key: 'mtHint', style: fieldHintStyle },
+                                t('limitsDefaultHint', { value: describeTokens(model.defaults?.maxTokens) })),
+                              h('div', { key: 'actions', style: { display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 2 } }, [
+                                h('button', { key: 'reset', type: 'button', style: smallButtonStyle, disabled: busy, onClick: () => resetLimits(model) }, t('limitsResetButton')),
+                                h('button', { key: 'cancel', type: 'button', style: smallButtonStyle, disabled: busy, onClick: closeLimits }, t('cancel')),
+                                h('button', { key: 'save', type: 'button', style: { ...buttonPrimaryStyle, minHeight: 26, padding: '2px 14px', fontSize: 12 }, disabled: busy, onClick: () => submitLimits(model) }, t('limitsSave')),
+                              ]),
+                            ],
+                          )
+                        : null,
+                    ],
                   ),
                 ),
               ),
@@ -533,11 +675,21 @@ window.__ModuleLoader__.load({
       copyFailed: 'Copy failed — select the text and copy manually.',
       keysTitle: 'Key pool',
       modelsTitle: 'Models in the picker',
-      modelsHint: '{count} of {total} models are shown in the model picker.',
+      modelsHint: '{count} of {total} models are shown. Context window and max output are editable per model — clear a field to restore the default.',
       modelsAllHidden: 'Every model is hidden — the picker will be empty until you re-enable one.',
       modelsEmpty: 'No models yet. Add a key and refresh the list.',
       modelShown: '{id} is now shown',
       modelHidden: '{id} is hidden',
+      limitsEdit: 'Settings',
+      limitsWindow: 'Context window',
+      limitsOutput: 'Max output tokens',
+      limitsDefaultHint: 'Default {value}. Accepts 1M / 128K; clear the field to restore it.',
+      limitsSave: 'Save',
+      limitsResetButton: 'Restore default',
+      limitsReset: 'Restored default limits for {id}',
+      limitsSaved: 'Saved limits for {id}',
+      limitsCustom: '(custom)',
+      cancel: 'Cancel',
     };
 
     const zh = {
@@ -578,9 +730,20 @@ window.__ModuleLoader__.load({
       copyFailed: '复制失败，请手动选中文本复制。',
       keysTitle: 'Key 池',
       modelsTitle: '下拉中的模型',
-      modelsHint: '共 {total} 个模型，当前展示 {count} 个。',
+      modelsHint: '共 {total} 个模型，当前展示 {count} 个。窗口与最大输出可逐模型修改（清空输入框即恢复默认）。',
       modelsAllHidden: '所有模型都被隐藏了，模型选择器会是空的 —— 至少勾回一个。',
       modelsEmpty: '还没有模型，请先添加 key 并刷新列表。',
+      limitsEdit: '设置',
+      limitsWindow: '上下文窗口',
+      limitsOutput: '最大输出 token 数',
+
+      limitsDefaultHint: '默认 {value}，支持 1M / 128K 写法，留空即恢复默认。',
+      limitsSave: '保存',
+      limitsResetButton: '恢复默认',
+      limitsReset: '已恢复 {id} 的默认窗口',
+      limitsSaved: '已保存 {id} 的窗口设置',
+      limitsCustom: '（自定义）',
+      cancel: '取消',
       modelShown: '已展示 {id}',
       modelHidden: '已隐藏 {id}',
     };

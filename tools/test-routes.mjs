@@ -29,10 +29,11 @@ const ctx = {
 
 const pool = new KeyPool([], {});
 const modelRows = [
-  { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', contextWindow: 1048576, maxTokens: 65536, enabled: true },
-  { id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1048576, maxTokens: 131072, enabled: true },
+  { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', contextWindow: 1048576, maxTokens: 65536, defaults: { contextWindow: 1048576, maxTokens: 65536 }, overridden: false, enabled: true },
+  { id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1048576, maxTokens: 131072, defaults: { contextWindow: 1048576, maxTokens: 131072 }, overridden: false, enabled: true },
 ];
 const modelsChanged = [];
+const limitsChanged = [];
 registerKeyRoutes(ctx, {
   status: {
     pool: () => pool.snapshot(),
@@ -51,6 +52,20 @@ registerKeyRoutes(ctx, {
   onModelsChanged: async (disabled) => {
     modelsChanged.push(disabled);
     for (const row of modelRows) row.enabled = !disabled.includes(row.id);
+  },
+  onModelLimitsChanged: async (id, limits) => {
+    limitsChanged.push({ id, limits });
+    const row = modelRows.find((r) => r.id === id);
+    if (!row) return;
+    if (limits.contextWindow === undefined && limits.maxTokens === undefined) {
+      row.contextWindow = row.defaults.contextWindow;
+      row.maxTokens = row.defaults.maxTokens;
+      row.overridden = false;
+      return;
+    }
+    if (limits.contextWindow !== undefined) row.contextWindow = limits.contextWindow;
+    if (limits.maxTokens !== undefined) row.maxTokens = limits.maxTokens;
+    row.overridden = true;
   },
   reload: async () => {},
   fetchCatalog: async () => {},
@@ -194,6 +209,68 @@ console.log('\n[route] 模型可见性');
 
   const noId = await post('/plugins/dsh-sensenova-pool/keys', { action: 'set-model' }, { 'x-sensenova-pool-admin': adminKey });
   check('缺 id → 400', noId.status === 400, String(noId.status));
+}
+
+console.log('\n[route] 模型窗口/输出上限（issue #4）');
+{
+  const base = '/plugins/dsh-sensenova-pool/keys';
+  const admin = { 'x-sensenova-pool-admin': adminKey };
+
+  const saved1 = await post(base, { action: 'set-model-limits', id: 'deepseek-v4-flash', contextWindow: '2000000', maxTokens: '32000' }, admin);
+  check('保存窗口/输出 → 200', saved1.status === 200, JSON.stringify(saved1.body).slice(0, 160));
+  const row1 = saved1.body.models?.find((m) => m.id === 'deepseek-v4-flash');
+  check('生效值已更新', row1?.contextWindow === 2000000 && row1?.maxTokens === 32000, JSON.stringify(row1));
+  check('标记为自定义', row1?.overridden === true, JSON.stringify(row1?.overridden));
+  check('默认值保持不变', row1?.defaults?.contextWindow === 1048576, JSON.stringify(row1?.defaults));
+  check('回调收到完整值', limitsChanged.at(-1)?.limits?.contextWindow === 2000000, JSON.stringify(limitsChanged.at(-1)));
+
+  const noToken = await post(base, { action: 'set-model-limits', id: 'glm-5.2', contextWindow: '2000000' });
+  check('无令牌被拒 403', noToken.status === 403, String(noToken.status));
+
+  const bad = await post(base, { action: 'set-model-limits', id: 'glm-5.2', contextWindow: 'abc' }, admin);
+  check('非数字 → 400', bad.status === 400, String(bad.status));
+
+  const tooSmall = await post(base, { action: 'set-model-limits', id: 'glm-5.2', contextWindow: '100' }, admin);
+  check('窗口小于 1024 → 400', tooSmall.status === 400, String(tooSmall.status));
+
+  const outTooBig = await post(base, { action: 'set-model-limits', id: 'glm-5.2', contextWindow: '200000', maxTokens: '200000' }, admin);
+  check('输出不小于窗口 → 400', outTooBig.status === 400, String(outTooBig.status));
+
+  const unknownModel = await post(base, { action: 'set-model-limits', id: 'no-such-model', contextWindow: '200000' }, admin);
+  check('未知模型 → 404', unknownModel.status === 404, String(unknownModel.status));
+
+  // 缩写：1M / 128K（与宿主模型配置页一致）。
+  const abbrev = await post(base, { action: 'set-model-limits', id: 'glm-5.2', contextWindow: '2M', maxTokens: '128K' }, admin);
+  const rowAbbr = abbrev.body.models?.find((m) => m.id === 'glm-5.2');
+  check('2M / 128K 缩写被解析', rowAbbr?.contextWindow === 2097152 && rowAbbr?.maxTokens === 131072, JSON.stringify(rowAbbr));
+
+  const decimal = await post(base, { action: 'set-model-limits', id: 'glm-5.2', contextWindow: '1.5M', maxTokens: '32k' }, admin);
+  const rowDec = decimal.body.models?.find((m) => m.id === 'glm-5.2');
+  check('小数与大小写都认（1.5M / 32k）', rowDec?.contextWindow === 1572864 && rowDec?.maxTokens === 32768, JSON.stringify(rowDec));
+
+  const spaced = await post(base, { action: 'set-model-limits', id: 'glm-5.2', contextWindow: ' 3 m ', maxTokens: ' 64 K ' }, admin);
+  const rowSpaced = spaced.body.models?.find((m) => m.id === 'glm-5.2');
+  check('空格随意（3 m / 64 K）', rowSpaced?.contextWindow === 3145728 && rowSpaced?.maxTokens === 65536, JSON.stringify(rowSpaced));
+
+  const badUnit = await post(base, { action: 'set-model-limits', id: 'glm-5.2', contextWindow: '1MB' }, admin);
+  check('非法单位（1MB）→ 400', badUnit.status === 400, String(badUnit.status));
+
+  const zeroUnit = await post(base, { action: 'set-model-limits', id: 'glm-5.2', contextWindow: '0K' }, admin);
+  check('0K → 400', zeroUnit.status === 400, String(zeroUnit.status));
+
+  const negative = await post(base, { action: 'set-model-limits', id: 'glm-5.2', contextWindow: '-1M' }, admin);
+  check('负数 → 400', negative.status === 400, String(negative.status));
+
+  // 复原，避免影响后面的断言。
+  await post(base, { action: 'set-model-limits', id: 'glm-5.2', contextWindow: '', maxTokens: '' }, admin);
+
+  // 传回默认值 = 恢复默认（服务端归一成 undefined，不落库）。
+  const reset = await post(base, { action: 'set-model-limits', id: 'deepseek-v4-flash', contextWindow: '1048576', maxTokens: '65536' }, admin);
+  const row2 = reset.body.models?.find((m) => m.id === 'deepseek-v4-flash');
+  check('传回默认值 → 恢复默认', row2?.overridden === false && row2?.contextWindow === 1048576, JSON.stringify(row2));
+  check('恢复默认时两字段都未传',
+    limitsChanged.at(-1)?.limits?.contextWindow === undefined && limitsChanged.at(-1)?.limits?.maxTokens === undefined,
+    JSON.stringify(limitsChanged.at(-1)));
 }
 
 console.log('\n[route] 未知操作与错误处理');

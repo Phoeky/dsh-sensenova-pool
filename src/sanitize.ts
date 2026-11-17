@@ -38,7 +38,7 @@
  *   * 未知 role（除 developer 外）：猜错会掩盖真正的调用错误。
  */
 
-import { coerceReasoningEffort } from './catalog.js';
+import { coerceReasoningEffort, fixedParamsFor } from './catalog.js';
 
 /** 商汤不认识的角色名 → 映射成等价角色。`developer` 是 OpenAI 新规范里替代 system 的角色。 */
 const ROLE_ALIASES: Readonly<Record<string, string>> = { developer: 'system' };
@@ -178,6 +178,27 @@ function sanitizeReasoningEffort(body: Record<string, unknown>, changes: string[
 }
 
 /**
+ * 应用「该模型只有唯一合法值」的采样参数。
+ *
+ * 实测（2026-11-17）：`kimi-k3` 收到 `temperature: 0` 或 `0.7` 都会 400
+ * `field Temperature invalid, only 1 is allowed for this model`。它不是「校验严」，
+ * 而是**只提供**这一个值 —— 既然没有第二个合法值，这里兜住才不会让整轮失败。
+ *
+ * 只在请求里已经带了 `temperature` 且不等于合法值时才动手：没带就交给上游默认，
+ * 不额外增加改动。
+ */
+function applyFixedParams(body: Record<string, unknown>, changes: string[]): void {
+  const model = typeof body.model === 'string' ? body.model : undefined;
+  const fixed = fixedParamsFor(model);
+  if (fixed === undefined) return;
+  if (fixed.temperature === undefined) return;
+  if (body.temperature === undefined || body.temperature === fixed.temperature) return;
+
+  body.temperature = fixed.temperature;
+  if (!changes.includes('temperature')) changes.push('temperature');
+}
+
+/**
  * 清洗一份 OpenAI chat 请求体。
  *
  * 只做**语义等价**的改写，不改变请求意图；返回改动清单便于排查。
@@ -209,6 +230,7 @@ export function sanitizeChatRequest<T>(input: T): SanitizeResult<T> {
   }
 
   sanitizeReasoningEffort(body, changes);
+  applyFixedParams(body, changes);
 
   if ('messages' in body) {
     const next = sanitizeMessages(body.messages, changes);

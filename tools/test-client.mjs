@@ -53,6 +53,33 @@ check('提供复制能力', code.includes('copyText'));
 check('模型可见性开关（set-model）', code.includes("action: 'set-model'"));
 check('模型列表来自 /status', code.includes('status.models'));
 
+console.log('\n[client] 模型窗口设置（issue #4）');
+check('调用 set-model-limits 接口', code.includes("action: 'set-model-limits'"));
+check('入口是「设置」按钮，不再是内联输入', code.includes("t('limitsEdit')") && !code.includes('saveLimits'));
+check('字段名用「上下文窗口 / 最大输出 token 数」', code.includes("'上下文窗口'") && code.includes("'最大输出 token 数'"));
+check('保存/取消/恢复默认三个动作齐全',
+  code.includes("t('limitsSave')") && code.includes("t('cancel')") && code.includes("t('limitsResetButton')"));
+check('保存前只改草稿（value 受控）', code.includes('value: limitWindow') && code.includes('value: limitOutput'));
+check('输入框是文本框（才输得进 1M / 128K）', code.includes("inputMode: 'numeric'") && !code.includes("type: 'number'"));
+check('提示里说明支持 1M / 128K', code.includes('1M / 128K'));
+
+console.log('\n[client] 文案键完整性');
+{
+  // 界面里的 t('key') 必须在中英文字典里都有 —— 漏一个就会在页面上显示成键名。
+  const usedKeys = new Set([...code.matchAll(/\bt\('([A-Za-z0-9_]+)'/g)].map((m) => m[1]));
+  const blockKeys = (start) => {
+    const end = code.indexOf('\n    };', start);
+    const block = code.slice(start, end);
+    return new Set([...block.matchAll(/^\s{6}([A-Za-z0-9_]+):/gm)].map((m) => m[1]));
+  };
+  const enKeys = blockKeys(code.indexOf('    const en = {'));
+  const zhKeys = blockKeys(code.indexOf('    const zh = {'));
+  const missing = [...usedKeys].filter((key) => !enKeys.has(key) || !zhKeys.has(key));
+  check('所有 t() 键都有中英文案', missing.length === 0, JSON.stringify(missing));
+  const mismatch = [...enKeys].filter((key) => !zhKeys.has(key)).concat([...zhKeys].filter((key) => !enKeys.has(key)));
+  check('中英文字案键一一对应', mismatch.length === 0, JSON.stringify(mismatch));
+}
+
 console.log('\n[client] 与宿主路由的契约');
 // 客户端用 BASE 常量 + 后缀拼 URL（比散落的字面量更不易写错），因此这里
 // 同时校验 BASE 与各后缀都出现。
