@@ -23,6 +23,7 @@ const SUITES = [
   { name: 'key 轮换池逻辑', file: 'test-rotate.mjs', args: [] },
   { name: '回环 shim 协议', file: 'test-shim.mjs', args: [] },
   { name: '请求体清洗（issue #2）', file: 'test-sanitize.mjs', args: [] },
+  { name: '推理档位按模型映射（issue #3）', file: 'test-reasoning-efforts.mjs', args: [] },
   { name: 'apply() 启动时序', file: 'test-apply.mjs', args: ['--import', './tools/stub-loader.mjs'] },
   { name: '凭据记录 schema', file: 'test-credentials-record.mjs', args: ['--import', './tools/stub-loader.mjs'] },
   { name: '启动期凭据竞态（issue #1）', file: 'test-credentials-race.mjs', args: ['--import', './tools/stub-loader.mjs'] },

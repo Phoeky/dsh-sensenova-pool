@@ -2,6 +2,7 @@
  * shim 端到端验证：起真实的回环 HTTP 服务，走完整 OpenAI 协议，
  * 用假的 upstream 注入 429，确认上层看到的是「从不 429」的稳定端点。
  */
+import { reasoningEffortsFor } from '../lib/catalog.js';
 import { KeyPool } from '../lib/keypool.js';
 import { ModelCatalog } from '../lib/shim.js';
 import { createShim } from '../lib/shim.js';
@@ -197,10 +198,11 @@ console.log('\n[shim] 请求体清洗：Agent 合法但商汤不认的写法在�
       for (const f of ['temperature', 'top_p', 'frequency_penalty', 'presence_penalty']) {
         if (f in lastSent && typeof lastSent[f] !== 'number') return reject('invalid arguments');
       }
-      // 上游报错原文：should be one of: none, minimal, low, medium, high, xhigh, max
+      // 商汤的合法词表是**按模型**判定的（issue #3）：glm-5.3 只认 low/high/max，
+      // glm-5.2 七档全收。这里直接复用插件的词表，假上游才和真上游一样严格。
       if (
         lastSent.reasoning_effort !== undefined &&
-        !['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(lastSent.reasoning_effort)
+        !reasoningEffortsFor(lastSent.model).includes(lastSent.reasoning_effort)
       ) {
         return reject('field ReasoningEffort invalid');
       }
@@ -316,6 +318,62 @@ console.log('\n[shim] 干净请求原样转发（清洗不引入多余改动）'
   check('带 tool_calls 的 content:null 未被改动', JSON.parse(rawSent).messages[2].content === null);
 
   globalThis.fetch = realFetch4;
+  await shim.close();
+}
+
+console.log('\n[shim] 推理档按模型纠正：glm-5.3 收到 xhigh 时改发 max（issue #3）');
+{
+  const pool = new KeyPool(['sk-effort'], { maxConcurrency: 4 });
+  const catalog = new ModelCatalog();
+  const logs = [];
+  const shim = createShim({
+    pool,
+    catalog,
+    baseUrl: UPSTREAM,
+    logger: { info: (m) => logs.push(m), warn: (m) => logs.push(m), error: (m) => logs.push(m) },
+  });
+  await shim.ready;
+  const base = shim.baseUrl();
+
+  const realFetch5 = realFetch;
+  let sent = null;
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('token.sensenova.cn')) {
+      sent = JSON.parse(init.body);
+      const vocab = reasoningEffortsFor(sent.model);
+      if (sent.reasoning_effort !== undefined && !vocab.includes(sent.reasoning_effort)) {
+        return new Response(
+          JSON.stringify({
+            error: { message: `field ReasoningEffort invalid, should be one of: ${vocab.join(', ')}`, type: 'invalid_request_error', code: '3' },
+          }),
+          { status: 400, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return new Response(JSON.stringify({ id: 'z', choices: [{ message: { role: 'assistant', content: 'ok' } }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    return realFetch5(url, init);
+  };
+
+  const res = await realFetch(`${base}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${shim.token()}`, 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'glm-5.3',
+      stream: false,
+      reasoning_effort: 'xhigh',
+      messages: [{ role: 'user', content: 'hi' }],
+    }),
+  });
+  await res.text();
+
+  check('glm-5.3 + xhigh 没有被上游拒绝', res.status === 200, String(res.status));
+  check('上游实际收到 max（不是 xhigh）', sent?.reasoning_effort === 'max', String(sent?.reasoning_effort));
+  check('日志记录了规范化', logs.some((l) => l.includes('已规范化请求体字段')), JSON.stringify(logs.slice(-3)));
+
+  globalThis.fetch = realFetch5;
   await shim.close();
 }
 

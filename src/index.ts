@@ -24,7 +24,7 @@ import { createProvider } from '@earendil-works/pi-ai';
 import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy';
 import z from '@deepseek-ai/schemastery';
 
-import { DEFAULT_BASE_URL, type SenseNovaModel } from './catalog.js';
+import { DEFAULT_BASE_URL, thinkingLevelMapFor, type SenseNovaModel } from './catalog.js';
 import { KeyPool, keyIdOf, maskKey } from './keypool.js';
 import { ModelCatalog, createShim, type Shim } from './shim.js';
 import { registerKeyRoutes, registerSettingsSection, type StatusProvider } from './routes.js';
@@ -444,27 +444,18 @@ export function apply(ctx: any, config: PluginConfig): void {
         provider: PROVIDER_ID,
         baseUrl,
         input: model.supportsImages ? ['text', 'image'] : ['text'],
-        // 商汤的思考等级。
+        // 商汤的思考等级 —— **每个模型的合法词表不同**（issue #3）：`glm-5.3`
+        // 只认 low / high / max（真机发 xhigh、none 都是 400），而 `glm-5.2`、
+        // `deepseek-v4-flash` 七档全收。
         //
-        // 取值经**实测**确定：`reasoning_effort` 只接受
-        // `none | low | medium | high | xhigh`。传 `off` / `max` / `minimal`
-        // 会得到 400 `field ReasoningEffort invalid`（曾经踩过这个坑）。
-        // 因此这里把 DSH 的等级名映射到商汤的拼写：
-        //   off → none（关闭思考），minimal → 不支持，max → xhigh（最高的合法档）。
+        // 这里只把**实测支持**的档位给 pi-ai，不支持的写 null —— 于是模型选择器里
+        // glm-5.3 的思考档只剩 Low / High / Max，声明什么就发什么。缺档的兜底（例如
+        // 别的客户端发来 xhigh）由 shim 清洗层就近归位，不在这里做。
+        //
+        // 全局表的教训：把 `max` 统一翻成 `xhigh` 会让 glm-5.3 的每次调用都
+        // 400，而不翻又会让七档全收的模型浪费掉 `max` —— 怎么调都会踩到某一头。
         reasoning: model.reasoning,
-        ...(model.reasoning
-          ? {
-              thinkingLevelMap: {
-                off: 'none',
-                minimal: null,
-                low: 'low',
-                medium: 'medium',
-                high: 'high',
-                xhigh: 'xhigh',
-                max: 'xhigh',
-              },
-            }
-          : {}),
+        ...(model.reasoning ? { thinkingLevelMap: thinkingLevelMapFor(model.id) } : {}),
         cost: NO_COST,
         contextWindow: model.contextWindow,
         maxTokens: model.maxTokens,

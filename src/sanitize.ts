@@ -23,15 +23,22 @@
  *     "content": 123                          ← 必须是字符串或数组
  *     "temperature": "0.7"                    ← 必须是数字
  *     "logprobs" / "top_logprobs" / "metadata"
- *     "reasoning_effort": "off" / "max" / "minimal"
+ *     "reasoning_effort": "off"               ← 商汤拼作 none
  *
  * 规范成等价安全写法后实测全部 200。
+ *
+ * 注意 `max` / `minimal` **本来就是合法值**，不能映射掉（issue #2 的结论）；
+ * 它们之所以仍可能 400，是因为**每个模型接受的词表不同**（issue #3）：
+ * `glm-5.3` 只认 `low / high / max`，收到 `xhigh` 一样 400。词表与就近归位
+ * 规则集中在 catalog.ts，本文件只负责在转发前按词表把值改合法。
  *
  * 刻意**不代改**的三类（改了是把错误往后推，甚至篡改用户意图）：
  *   * `user.content` 为 null/""：确实是空用户轮，上游报 `user content required`；
  *   * 数值越界（temperature=3、frequency_penalty=5）：上游报错信息已足够明确；
  *   * 未知 role（除 developer 外）：猜错会掩盖真正的调用错误。
  */
+
+import { coerceReasoningEffort } from './catalog.js';
 
 /** 商汤不认识的角色名 → 映射成等价角色。`developer` 是 OpenAI 新规范里替代 system 的角色。 */
 const ROLE_ALIASES: Readonly<Record<string, string>> = { developer: 'system' };
@@ -44,28 +51,6 @@ const UNSUPPORTED_FIELDS = ['logprobs', 'top_logprobs', 'metadata'] as const;
 
 /** 必须是数字的采样参数（pi-ai 偶尔会传字符串）。 */
 const NUMERIC_PARAMS = ['temperature', 'top_p', 'frequency_penalty', 'presence_penalty'] as const;
-
-/**
- * `reasoning_effort` 的合法取值。
- *
- * 实测（2026-10-30，deepseek-v4-flash）上游报错原文写得很明确：
- *   `field ReasoningEffort invalid, should be one of:
- *    none, minimal, low, medium, high, xhigh, max`
- *
- * 注意 **`minimal` 与 `max` 都是合法的** —— 不能像有些资料说的那样把它们
- * 当成非法值映射掉，那会悄悄改掉用户要求的推理等级（`max` 尤其明显）。
- * 唯一需要翻译的是 DSH 侧的 `off`，商汤拼作 `none`。
- */
-const REASONING_EFFORT_ALIASES: Readonly<Record<string, string>> = { off: 'none' };
-const REASONING_EFFORT_ALLOWED = new Set([
-  'none',
-  'minimal',
-  'low',
-  'medium',
-  'high',
-  'xhigh',
-  'max',
-]);
 
 export interface SanitizeResult<T> {
   body: T;
@@ -163,36 +148,33 @@ function sanitizeMessages(
   });
 }
 
-/** 归一 `reasoning_effort`；无法识别时直接摘掉该字段（比猜一个值更安全）。 */
+/**
+ * 归一 `reasoning_effort`（issue #3：**每个模型的合法词表不同**）。
+ *
+ * 三层判断，全部交给 catalog.ts：
+ *   1. `off` → `none`（商汤拼写）；
+ *   2. 该模型实测词表里有这个拼写 → 原样放行（只做小写归一）；
+ *   3. 词表里没有 → **已知**模型就近归位（`glm-5.3` 的 `xhigh` → `max`），
+ *      **未知**模型不猜（没有实测依据，改了只会掩盖上游的真实报错）。
+ *
+ * 认不出来的取值（拼写错误、将来新增的档位）直接摘掉字段 —— 不发垃圾值撞 400。
+ */
 function sanitizeReasoningEffort(body: Record<string, unknown>, changes: string[]): void {
   if (!('reasoning_effort' in body)) return;
-  const raw = body.reasoning_effort;
 
-  if (typeof raw !== 'string') {
+  const raw = body.reasoning_effort;
+  const model = typeof body.model === 'string' ? body.model : undefined;
+  const { value, changed } = coerceReasoningEffort(model, typeof raw === 'string' ? raw : '');
+
+  if (value === undefined) {
     delete body.reasoning_effort;
     changes.push('reasoning_effort');
     return;
   }
-
-  const lowered = raw.trim().toLowerCase();
-  if (REASONING_EFFORT_ALLOWED.has(lowered)) {
-    if (lowered !== raw) {
-      body.reasoning_effort = lowered;
-      changes.push('reasoning_effort');
-    }
-    return;
-  }
-
-  const mapped = REASONING_EFFORT_ALIASES[lowered];
-  if (mapped !== undefined) {
-    body.reasoning_effort = mapped;
+  if (changed) {
+    body.reasoning_effort = value;
     changes.push('reasoning_effort');
-    return;
   }
-
-  // 未知取值：删掉比瞎映射更安全（关掉这一轮思考，而不是发出非法值撞 400）。
-  delete body.reasoning_effort;
-  changes.push('reasoning_effort');
 }
 
 /**

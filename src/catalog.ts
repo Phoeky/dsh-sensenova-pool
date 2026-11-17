@@ -38,6 +38,215 @@ export const BUILTIN_MODELS: readonly SenseNovaModel[] = [
 
 export const DEFAULT_BASE_URL = 'https://token.sensenova.cn/v1';
 
+// --------------------------------------------------------- 推理档位（issue #3）
+
+/**
+ * 商汤 `reasoning_effort` 的合法拼写，按推理强度从弱到强排列。
+ *
+ * 上游的 400 原文把七档列得很全（`field ReasoningEffort invalid, should be one
+ * of: none, minimal, low, medium, high, xhigh, max`），但**每个模型实际接受的
+ * 子集不同**：`glm-5.3` 只认 `low / high / max`，发 `xhigh` 直接 400；而
+ * `glm-5.2`、`deepseek-v4-flash` 七档全收（issue #3 的逐模型实测矩阵）。
+ *
+ * 所以「哪几个值安全」不是全局属性 —— 一张全局映射表无论怎么调都会踩到某一头。
+ * 这里改成按模型维护词表，见 {@link MODEL_REASONING_EFFORTS}。
+ */
+export const REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
+
+/**
+ * DSH（pi-ai）侧的思考档位名，同样从弱到强。
+ *
+ * 与 {@link REASONING_EFFORTS} 一一对应，只差一个拼写：DSH 的 `off` 商汤
+ * 写作 `none`。
+ */
+export const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+
+/**
+ * 每个模型**实测**接受的上游 `reasoning_effort` 词表
+ * （issue #3，2026-11-14 对 `token.sensenova.cn` 逐个模型逐个档位实测，
+ * 撞 429 的格子已重试排除）。
+ *
+ * 「未确认」的档位**不写进来**：写漏顶多把这一档就近归位到合法档，写多了会让
+ * 整条链路每次都 400 —— 用户会直接无法使用该模型。
+ *
+ * 本表**按模型 id 查**，不依赖 {@link BUILTIN_MODELS}：`/v1/models` 动态目录里
+ * 新出现的模型（例如目前还不在基线目录里的 `glm-5.3`）只要这里补一行就生效。
+ *
+ * 没列在这里的模型（新上架、或本文写作时还未实测的）走
+ * {@link DEFAULT_REASONING_EFFORTS}；补词表是唯一需要做的维护动作。
+ */
+export const MODEL_REASONING_EFFORTS: Readonly<Record<string, readonly ReasoningEffort[]>> = {
+  /** 只认三档；`none` / `minimal` / `medium` / `xhigh` 实测全部 400。 */
+  'glm-5.3': ['low', 'high', 'max'],
+  /** 七档全收。 */
+  'glm-5.2': REASONING_EFFORTS,
+  'deepseek-v4-flash': REASONING_EFFORTS,
+  'sensenova-6.8-flash': REASONING_EFFORTS,
+  'sensenova-6.8-flash-lite': REASONING_EFFORTS,
+  /** `max` 多次重试仍撞 429，未确认 → 不发。 */
+  'kimi-k3': ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'],
+  /** `xhigh` 未确认 → 不发。 */
+  'deepseek-flash': ['none', 'minimal', 'low', 'medium', 'high', 'max'],
+};
+
+/**
+ * 未实测模型的保守词表：只用**所有**实测模型都接受的拼写。
+ *
+ * 七档里只有 `low` / `high` 是全员交集（`glm-5.3` 缺
+ * `none`/`minimal`/`medium`/`xhigh`，`kimi-k3` 缺 `max`，
+ * `deepseek-flash` 缺 `xhigh`），因此用它永远不会撞 400。
+ *
+ * 代价是新模型的上限被压到 `high`。这是有意的取舍：新模型上线时先把词表补进
+ * {@link MODEL_REASONING_EFFORTS}，而不是先让用户吃一轮 400。
+ */
+export const DEFAULT_REASONING_EFFORTS: readonly ReasoningEffort[] = ['low', 'high'];
+
+/** 模型 id 归一：上游 id 全是小写，但请求体里的写法不由我们控制。 */
+function normalizeModelId(modelId: string | undefined): string | undefined {
+  if (typeof modelId !== 'string') return undefined;
+  const id = modelId.trim().toLowerCase();
+  return id.length > 0 ? id : undefined;
+}
+
+/** 该模型的上游词表；未实测的模型返回保守默认表。 */
+export function reasoningEffortsFor(modelId: string | undefined): readonly ReasoningEffort[] {
+  const id = normalizeModelId(modelId);
+  return (id === undefined ? undefined : MODEL_REASONING_EFFORTS[id]) ?? DEFAULT_REASONING_EFFORTS;
+}
+
+/** 该模型是否有实测词表（决定清洗层敢不敢替调用方改档位）。 */
+export function hasMeasuredReasoningEfforts(modelId: string | undefined): boolean {
+  const id = normalizeModelId(modelId);
+  return id !== undefined && MODEL_REASONING_EFFORTS[id] !== undefined;
+}
+
+/** 上游拼写的强度序号（`none` = 0 … `max` = 6）。 */
+function effortRank(effort: ReasoningEffort): number {
+  return REASONING_EFFORTS.indexOf(effort);
+}
+
+/** 词表里最强的一档。 */
+function strongestEffort(vocab: readonly ReasoningEffort[]): ReasoningEffort {
+  return vocab.reduce((best, effort) => (effortRank(effort) > effortRank(best) ? effort : best), vocab[0]);
+}
+
+/** 词表里最弱的一档。 */
+function weakestEffort(vocab: readonly ReasoningEffort[]): ReasoningEffort {
+  return vocab.reduce((worst, effort) => (effortRank(effort) < effortRank(worst) ? effort : worst), vocab[0]);
+}
+
+/**
+ * 词表内「不超过 target 的最强档」；词表里没有更弱的档时退回最弱档。
+ *
+ * 「不超过」是有意的：`medium` 这类中间档在缺档模型上向下取（`glm-5.3` 的
+ * `medium → low`），宁可省 token，也不要悄悄把用户没要求的成本抬到 `high`。
+ */
+function nearestAtOrBelow(vocab: readonly ReasoningEffort[], target: number): ReasoningEffort {
+  let best: ReasoningEffort | undefined;
+  for (const effort of vocab) {
+    if (effortRank(effort) > target) continue;
+    if (best === undefined || effortRank(effort) > effortRank(best)) best = effort;
+  }
+  return best ?? weakestEffort(vocab);
+}
+
+/**
+ * 把一个 DSH 档位翻译成该模型接受的**上游拼写**（就近归位）。
+ *
+ * 只给 shim 清洗层用：那是「已经收到一个不该出现的档位、必须改成合法值」的场合。
+ * 注册给 pi-ai 的 `thinkingLevelMap` **不用**它 —— 声明能力时要如实写 `null`，
+ * 而不是替用户挑一个替代档（见 {@link thinkingLevelMapFor}）。
+ *
+ * 规则（issue #3）：
+ *   1. 词表里有同名档 → 直接用；
+ *   2. `xhigh` / `max` 属于「饱和区」：用户明确要了「极高 / 最高」，缺档时由
+ *      该模型最强的档承接，**不降级**（`glm-5.3` 的 `xhigh → max`）。`kimi-k3`
+ *      的 `max → xhigh` 是它本来就没有更高档，不是我们改主意；
+ *   3. 其余档（含 `off`）取词表内不超过它的最强档，没有更弱档就取最弱档 ——
+ *      于是无法关闭思考的模型（`glm-5.3`）把 `off` 落成 `low`。
+ */
+export function thinkingEffortFor(modelId: string | undefined, level: ThinkingLevel): ReasoningEffort {
+  const vocab = reasoningEffortsFor(modelId);
+  const same = level === 'off' ? undefined : (level as ReasoningEffort);
+  if (same !== undefined && vocab.includes(same)) return same;
+  if (level === 'xhigh' || level === 'max') return strongestEffort(vocab);
+  // DSH 的 `off` 对应上游的 `none`（强度 0）。
+  const target = level === 'off' ? effortRank('none') : effortRank(level as ReasoningEffort);
+  return nearestAtOrBelow(vocab, target);
+}
+
+/**
+ * 该模型注册进 pi-ai 时用的 `thinkingLevelMap`。
+ *
+ * **只有实测支持的档位给出拼写，其余一律 `null`**。`null` 在 pi-ai / DSH 里的
+ * 含义就是「这个模型没有这一档」：`getSupportedThinkingLevels()` 会把它们从模型
+ * 选择器里摘掉，于是 `glm-5.3` 的思考档下拉只剩 **Low / High / Max**（+`Default`）。
+ *
+ * 为什么不像早先那样「把缺档就近归位」（`xhigh → max`）：
+ * 那样 UI 上仍然有 7 档，用户选 `Xhigh` 实际发的是 `max`、选 `Off` 实际发的是
+ * `low` —— 看着能用，发出去的不是他选的东西，等于用 UI 撒谎。声明的能力应当
+ * 与实际能力一致；**兜住非法值**的活交给 shim 清洗层（{@link coerceReasoningEffort}），
+ * 那里是真的收到了一个不该出现的值才动手。
+ *
+ * 键一定要写全（包括 `null`）：pi-ai 对**缺失**键的处理是不对称的 —— 前五档视为
+ * 「支持、用 provider 默认」，`xhigh`/`max` 视为「不支持」；显式给 `null` 才确定。
+ */
+export function thinkingLevelMapFor(modelId: string | undefined): Record<ThinkingLevel, ReasoningEffort | null> {
+  const vocab = reasoningEffortsFor(modelId);
+  const map = {} as Record<ThinkingLevel, ReasoningEffort | null>;
+  for (const level of THINKING_LEVELS) {
+    // DSH 的 `off` 对应上游的 `none`，两者是同一档。
+    const spelling: ReasoningEffort = level === 'off' ? 'none' : (level as ReasoningEffort);
+    map[level] = vocab.includes(spelling) ? spelling : null;
+  }
+  return map;
+}
+
+/** 清洗层的归一结果。 */
+export interface ReasoningEffortCoercion {
+  /** 应发给上游的合法拼写；`undefined` 表示认不出来（调用方应摘掉该字段）。 */
+  value?: ReasoningEffort;
+  /** 是否改写了调用方传进来的值。 */
+  changed: boolean;
+}
+
+/**
+ * 把请求体里的 `reasoning_effort` 规整到该模型接受的词表内（shim 清洗层用）。
+ *
+ * 和注册层不同，这里**只动已知模型的已知问题**：
+ *   * 未实测的模型原样放行 —— 我们没有它的词表，猜一个只会把「上游如实报错」
+ *     变成「上游收到了被我们悄悄改过的请求」，那正是 issue #2 批评过的做法；
+ *   * 已知模型则按 {@link thinkingEffortFor} 就近归位，保证不发非法拼写。
+ *
+ * 认不出来的取值（拼写错误、将来新增的档位）返回 `value: undefined`，由调用方
+ * 摘掉字段 —— 不发垃圾值去撞 400。
+ */
+export function coerceReasoningEffort(modelId: string | undefined, requested: string): ReasoningEffortCoercion {
+  const lowered = requested.trim().toLowerCase();
+  // `off`（DSH 拼写）与 `none`（商汤拼写）是同一档，两个都要认 —— 否则上一轮
+  // 被我们改写成 `none` 的请求，下一轮会被当成「认不出来的取值」摘掉，清洗层
+  // 就不再幂等。
+  const level: ThinkingLevel | undefined =
+    lowered === 'off' || lowered === 'none'
+      ? 'off'
+      : (THINKING_LEVELS as readonly string[]).includes(lowered)
+        ? (lowered as ThinkingLevel)
+        : undefined;
+  if (level === undefined) return { changed: false };
+
+  // DSH 的 `off` 商汤写作 `none`。
+  const spelling: ReasoningEffort = level === 'off' ? 'none' : (level as ReasoningEffort);
+  const vocab = reasoningEffortsFor(modelId);
+  if (vocab.includes(spelling) || !hasMeasuredReasoningEfforts(modelId)) {
+    return { value: spelling, changed: spelling !== requested };
+  }
+
+  const mapped = thinkingEffortFor(modelId, level);
+  return { value: mapped, changed: mapped !== requested };
+}
+
 /** `/v1/models` 返回的条目形状（只声明用到的字段）。 */
 interface RawModelEntry {
   id?: unknown;

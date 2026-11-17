@@ -63,7 +63,7 @@
 
 启动时内置一份保守目录（无需网络即可用），拿到有效 Key 后自动通过 `/v1/models` 刷新，**商汤日后上线新模型无需升级插件**。
 
-思考等级同样支持，可选 `none / low / medium / high / xhigh`。
+思考等级同样支持，且**档位按模型自动适配**：`glm-5.3` 只认 `low / high / max`，`glm-5.2` 七档全收，缺档时自动就近归位而不是撞 400（见下文「思考档位按模型映射」）。
 
 ### ⚙️ 零配置
 
@@ -279,7 +279,8 @@ records:
 | `content` 传数字（`123`） | ❌ 400 `invalid arguments` | 必须是字符串或数组 |
 | `temperature` 等传字符串（`"0.7"`） | ❌ 400 `invalid arguments` | 必须是数字 |
 | `logprobs` / `top_logprobs` / `metadata` | ❌ 400 | 商汤不支持这些字段 |
-| `reasoning_effort` 传 `off` | ❌ 400 `field ReasoningEffort invalid` | 合法值只有 `none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`（`off` 要翻成 `none`） |
+| `reasoning_effort` 传 `off` | ❌ 400 `field ReasoningEffort invalid` | DSH 的 `off` 商汤拼作 `none` |
+| `reasoning_effort` 传**该模型不认的档位**（如 `glm-5.3` 收到 `xhigh`） | ❌ 400 `field ReasoningEffort invalid` | 合法词表**按模型**判定，见下方「思考档位按模型映射」 |
 
 **0.2.1 已修复**：shim 在转发前会把这些写法**语义等价**地规范成商汤接受的形式
 （`developer`→`system`、`null`/缺失的 content→`""`、`arguments` 对象→JSON 字符串、
@@ -295,6 +296,36 @@ records:
 > 💡 如果升级后仍报 400，说明是清洗层还没覆盖的新写法。此时把
 > `debugRequestOn400` 打开，插件的 400 日志里会**直接打出实际发出的请求体**，
 > 一眼就能定位是哪个字段——不用再猜。相关讨论见 [issue #2](https://github.com/Phoeky/dsh-sensenova-pool/issues/2)。
+
+### 思考档位按模型映射
+
+[issue #3](https://github.com/Phoeky/dsh-sensenova-pool/issues/3) 实测发现：上游的合法
+`reasoning_effort` 集合是**按模型**判定的，不是全局一张表。`glm-5.3` 只认
+`low / high / max`，收到 `xhigh` 就是 400；而 `glm-5.2`、`deepseek-v4-flash`
+七档全收。单一映射表无论怎么调都会踩到某一头。
+
+**0.2.2 起**改为每个模型维护一张实测词表：
+
+| 模型 | 实测接受的档位 |
+|---|---|
+| `glm-5.3` | `low` / `high` / `max` |
+| `glm-5.2`、`deepseek-v4-flash`、`sensenova-6.8-flash`、`sensenova-6.8-flash-lite` | 七档全收 |
+| `kimi-k3` | 七档，`max` 未确认 → 不发 |
+| `deepseek-flash` | 七档，`xhigh` 未确认 → 不发 |
+| 其他 / 新上架模型 | 保守表 `low` / `high`（全员交集，永不 400） |
+
+模型选择器里**只显示这张表里真实存在的档位**：`glm-5.3` 的思考档下拉就是
+`Low / High / Max`（+`Default`）—— 不会出现「选了 `Xhigh`、实际发 `max`」这种
+看着能用、发出去却换了值的档位。
+
+shim 侧另有一层兜底：万一别的客户端（或旧配置）发来该模型不认的值，转发前会
+**就近改合法** —— `xhigh` / `max` 这类饱和档由模型最强档承接（不降级，`glm-5.3` 的
+`xhigh → max`），其余档向下取（`medium → low`、`off → low`），宁可省 token 也不
+悄悄抬高成本。
+
+未实测的模型（新上架、或还没测过的）只显示保守表 `low` / `high` —— 七档里只有这两档
+是全员交集。写漏顶多降一档，写多会让整条链路每次都 400。新模型上架后，把它的词表
+补进 `MODEL_REASONING_EFFORTS`（`src/catalog.ts`）即可。
 
 **Key 会泄漏吗？**
 

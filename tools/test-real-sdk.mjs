@@ -71,7 +71,12 @@ try {
       baseUrl: 'http://127.0.0.1:12345/v1',
       input: ['text'],
       reasoning: true,
-      thinkingLevelMap: { off: 'off', minimal: null, low: 'low', medium: 'medium', high: 'high', xhigh: null, max: 'max' },
+      // 与 catalog.ts 的 thinkingLevelMapFor() 同形：七档全部给上游拼写，
+      // 不用 null（pi-ai 对 null 会 ?? 回落到 DSH 档位名原样发出）。
+      thinkingLevelMap: {
+        off: 'none', minimal: 'minimal', low: 'low', medium: 'medium',
+        high: 'high', xhigh: 'xhigh', max: 'max',
+      },
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: 1048576,
       maxTokens: 65536,
