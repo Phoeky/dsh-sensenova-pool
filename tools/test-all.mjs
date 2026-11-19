@@ -4,7 +4,8 @@
  * 用法：node tools/test-all.mjs
  *
  * 真机测试（需要真实 key、会消耗额度）单独跑：
- *   node tools/e2e-live.mjs <key>
+ *   node tools/e2e-live.mjs <key>          # 中国站
+ *   node tools/e2e-intl.mjs <intl-key>     # 国际站（token.sensenova.ai）
  *   node tools/e2e-storm-shim.mjs <key>
  *   ELECTRON_RUN_AS_NODE=1 "<DSH exe>" tools/test-real-sdk.mjs
  *   ELECTRON_RUN_AS_NODE=1 "<DSH exe>" tools/test-real-apply.mjs <key>
@@ -24,6 +25,7 @@ const SUITES = [
   { name: '回环 shim 协议', file: 'test-shim.mjs', args: [] },
   { name: '请求体清洗（issue #2）', file: 'test-sanitize.mjs', args: [] },
   { name: '推理档位按模型映射（issue #3）', file: 'test-reasoning-efforts.mjs', args: [] },
+  { name: '端点（中国站 / 国际站）', file: 'test-endpoints.mjs', args: [] },
   { name: 'apply() 启动时序', file: 'test-apply.mjs', args: ['--import', './tools/stub-loader.mjs'] },
   { name: '凭据记录 schema', file: 'test-credentials-record.mjs', args: ['--import', './tools/stub-loader.mjs'] },
   { name: '启动期凭据竞态（issue #1）', file: 'test-credentials-race.mjs', args: ['--import', './tools/stub-loader.mjs'] },

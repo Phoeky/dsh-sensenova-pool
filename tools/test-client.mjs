@@ -63,6 +63,14 @@ check('保存前只改草稿（value 受控）', code.includes('value: limitWind
 check('输入框是文本框（才输得进 1M / 128K）', code.includes("inputMode: 'numeric'") && !code.includes("type: 'number'"));
 check('提示里说明支持 1M / 128K', code.includes('1M / 128K'));
 
+console.log('\n[client] 上游端点选择');
+check('调用 set-endpoint 接口', code.includes("action: 'set-endpoint'"));
+check('从 /status 取端点状态', code.includes('status.upstreamEndpoint'));
+check('渲染两个端点的切换按钮', code.includes('upstream.options.map'));
+check('显示当前上游地址', code.includes('epUpstream'));
+check('baseUrl 被固定时给出提示', code.includes('epPinned'));
+check('有切换成功提示文案', code.includes("t('endpointSwitched'"));
+
 console.log('\n[client] 文案键完整性');
 {
   // 界面里的 t('key') 必须在中英文字典里都有 —— 漏一个就会在页面上显示成键名。

@@ -17,3 +17,7 @@ package-lock.json
 
 # 本地工作区数据（不属于插件产物）
 .workbuddy-ai/
+
+# 临时抓取/调试残留
+_tmp_*.json
+.commitmsg.tmp

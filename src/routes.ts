@@ -28,8 +28,10 @@ export interface StatusProvider {
   summary(): { total: number; healthy: number; cooldown: number; invalid: number; inflight: number };
   catalog(): { source: string; count: number; fetchedAt: number; error: string };
   rotations(): Array<{ keyId: string; kind: string; status: number; message: string; at: number }>;
-  /** 本地 shim 的对外接入信息（地址、端口、API Key）。 */
+  /** 本地 shim 的对外接入信息（回环地址、端口、对外 API Key）。 */
   endpoint(): { baseUrl: string; port: number; apiKey: string };
+  /** 上游端点的选择状态（中国站 / 国际站）。 */
+  upstreamEndpoint(): EndpointStatus;
   /** 目录里的全部模型 + 是否在下拉中展示 + 生效的窗口/输出上限。 */
   models(): Array<{
     id: string;
@@ -45,7 +47,29 @@ export interface StatusProvider {
   }>;
   providerId: string;
   providerName: string;
+  /** 当前生效的上游根地址（会随端点切换而变；单把 key 探活打到这里）。 */
   baseUrl: string;
+}
+
+export interface EndpointOption {
+  id: string;
+  /** 展示名（中国站 / 国际站）。 */
+  label: string;
+  /** 该端点的官方根地址。 */
+  baseUrl: string;
+  active: boolean;
+}
+
+export interface EndpointStatus {
+  /** 当前选中的端点 id。 */
+  current: string;
+  /** 当前真实的上游地址（config 固定了 baseUrl 时与所选端点的官方地址不同）。 */
+  upstream: string;
+  /** config 里写死了 baseUrl —— 切端点只换目录与额度，不改地址。 */
+  pinned: boolean;
+  /** 当前端点下每把 key 的本地 RPM 上限（0 = 不限流）。 */
+  rpmLimit: number;
+  options: EndpointOption[];
 }
 
 interface Logger {
@@ -64,6 +88,13 @@ export interface RouteDeps {
   onModelsChanged(disabled: string[]): Promise<void>;
   /** 某个模型的窗口/输出上限发生变更；两字段都缺省表示恢复默认。 */
   onModelLimitsChanged(id: string, limits: { contextWindow?: number; maxTokens?: number }): Promise<void>;
+  /**
+   * 上游端点发生变更（'cn' | 'intl'）。
+   *
+   * 实现方负责落盘、切换上游地址、换模型目录与重置 RPM 额度；未知 id 应抛错
+   * （路由层据此回 400）。
+   */
+  onEndpointChanged(id: string): Promise<void>;
   /** 重新从凭据库装载。 */
   reload(): Promise<void>;
   /** 主动拉取上游模型目录。 */
@@ -237,6 +268,8 @@ export function registerKeyRoutes(ctx: any, deps: RouteDeps): void {
         baseUrl: deps.status.baseUrl,
         // 对外接入信息：地址 / 端口 / API Key，供卡片展示并可复制到别的服务。
         endpoint: deps.status.endpoint(),
+        // 上游端点选择：卡片据此渲染「中国站 / 国际站」切换。
+        upstreamEndpoint: deps.status.upstreamEndpoint(),
         summary: deps.status.summary(),
         catalog: deps.status.catalog(),
         models: deps.status.models(),
@@ -375,6 +408,33 @@ export function registerKeyRoutes(ctx: any, deps: RouteDeps): void {
           return;
         }
 
+        // ---- 上游端点：中国站 ⇄ 国际站 -----------------------------------
+        //
+        // 两个站的 key 互不通用，选错端点只会得到 401；因此这里是**用户显式选择**，
+        // 不做「自动探测」。切换的连带效果（上游地址、模型目录、RPM 额度、key 冷却
+        // 状态）全部由 onEndpointChanged 负责，路由只做参数校验。
+        if (action === 'set-endpoint') {
+          const id = typeof body?.id === 'string' ? body.id : '';
+          const known = deps.status.upstreamEndpoint().options.map((option) => option.id);
+          if (!known.includes(id)) {
+            sendJson(res, 400, { error: `未知端点：${id || '(空)'}，可选：${known.join(' / ')}` });
+            return;
+          }
+          try {
+            await deps.onEndpointChanged(id);
+          } catch (error) {
+            sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+            return;
+          }
+          sendJson(res, 200, {
+            upstreamEndpoint: deps.status.upstreamEndpoint(),
+            // 换站后模型目录整批换掉，一并回传给卡片。
+            models: deps.status.models(),
+            catalog: deps.status.catalog(),
+          });
+          return;
+        }
+
         if (action === 'refresh-catalog') {
           await deps.fetchCatalog();
           sendJson(res, 200, { catalog: deps.status.catalog() });
@@ -410,6 +470,7 @@ export function registerKeyRoutes(ctx: any, deps: RouteDeps): void {
         return;
       }
 
+      // 现取上游地址：用户可能刚切换过端点。
       const base = deps.status.baseUrl.replace(/\/+$/, '');
       const started = Date.now();
       try {
@@ -417,7 +478,12 @@ export function registerKeyRoutes(ctx: any, deps: RouteDeps): void {
           method: 'POST',
           headers: { 'content-type': 'application/json', authorization: `Bearer ${candidate.key}` },
           body: JSON.stringify({
-            model: typeof body?.model === 'string' && body.model ? body.model : 'deepseek-v4-flash',
+            // 默认探活模型取自**当前端点**的目录：国际站没有 `deepseek-v4-flash`，
+            // 写死它会让每一次国际站探活都变成 404「模型不存在」，明明是 key 好用的。
+            model:
+              typeof body?.model === 'string' && body.model
+                ? body.model
+                : deps.status.models().find((model) => model.enabled)?.id ?? 'deepseek-v4-flash',
             messages: [{ role: 'user', content: 'ping' }],
             max_tokens: 1,
           }),
@@ -486,9 +552,16 @@ export function registerSettingsSection(ctx: any, deps: SettingsSectionDeps): vo
         default: [],
         description: '商汤日日新 API Key（可多把，遇 429 自动轮换）',
       },
+      // 端点也放进来：卡片里切换后会写回凭据记录，但配置文件里显式写的那一份
+      // （config.endpoint）应当能在设置里一眼看到，避免两处说法不一致。
+      endpoint: {
+        type: 'string',
+        default: 'cn',
+        description: '上游端点：cn = 中国站（token.sensenova.cn），intl = 国际站（token.sensenova.ai）',
+      },
     };
     try {
-      settings.installSection(ctx, deps.namespace, schema, { keys: [] }, {
+      settings.installSection(ctx, deps.namespace, schema, { keys: [], endpoint: 'cn' }, {
         onChange: () => {
           void deps.onKeysChanged();
         },

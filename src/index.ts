@@ -24,10 +24,25 @@ import { createProvider } from '@earendil-works/pi-ai';
 import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy';
 import z from '@deepseek-ai/schemastery';
 
-import { DEFAULT_BASE_URL, thinkingLevelMapFor, type SenseNovaModel } from './catalog.js';
+import {
+  DEFAULT_ENDPOINT_ID,
+  ENDPOINTS,
+  builtinModelsFor,
+  endpointFor,
+  isEndpointId,
+  thinkingLevelMapFor,
+  type EndpointId,
+  type SenseNovaEndpoint,
+  type SenseNovaModel,
+} from './catalog.js';
 import { KeyPool, keyIdOf, maskKey } from './keypool.js';
 import { ModelCatalog, createShim, type Shim } from './shim.js';
-import { registerKeyRoutes, registerSettingsSection, type StatusProvider } from './routes.js';
+import {
+  registerKeyRoutes,
+  registerSettingsSection,
+  type EndpointStatus,
+  type StatusProvider,
+} from './routes.js';
 
 /** 本插件注册的 provider 路由名（模型选择器里显示为此分组）。 */
 const PROVIDER_ID = 'sensenova-pool';
@@ -56,6 +71,24 @@ const STREAM_IDLE_TIMEOUT_MS = 300_000;
  */
 const DEFAULT_RPM_LIMIT = 2;
 
+/**
+ * 每个端点的默认 RPM 预限流值。
+ *
+ * 两个站的额度互不相干（账号与套餐都在各自的站上），所以额度也分开算：
+ * - 中国站沿用实测值 2（真实上限约 3 RPM，见上）；
+ * - 国际站取保守值 3：2026-11-19 用真实国际站 key 实测连续逐档位打点观察时长
+ *   一直在秒级，没有撞到限流。仍取低于「假设上限」的值 —— 本地预限流宁可保守，
+ *   调大它不会提高吞吐，只会更容易被限流。
+ *
+ * 用户在 config 里显式写了 `rpmLimit` 时，该值对**两个端点**都生效（见 apply）。
+ */
+const ENDPOINT_RPM_LIMIT: Readonly<Record<EndpointId, number>> = { cn: DEFAULT_RPM_LIMIT, intl: 3 };
+
+/** 该端点的默认 RPM 上限。 */
+function defaultRpmLimitFor(endpointId: EndpointId): number {
+  return ENDPOINT_RPM_LIMIT[endpointFor(endpointId).id];
+}
+
 /** 与 pi-ai 约定的本路由图片预算；与本插件无关但 profile 形状需要它。 */
 const REQUEST_IMAGE_BUDGETS = {
   maxRequestImageBytes: 20_971_520,
@@ -76,18 +109,34 @@ export const inject = ['llm'];
  * 这类非机密参数。
  */
 export const Config = z.object({
-  baseUrl: z.string().default(DEFAULT_BASE_URL).description('商汤日日新 API 根地址'),
+  endpoint: z
+    .string()
+    .default(DEFAULT_ENDPOINT_ID)
+    .description(
+      '上游端点：cn = 中国站（token.sensenova.cn），intl = 国际站（token.sensenova.ai）。' +
+        '两个站的 key 互不通用；也可以在设置卡片里切换，切换结果会持久化。' +
+        '写错的值不会被拒绝，而是回落到 cn（不让一个拼写问题把插件卡在加载阶段）。',
+    ),
+  baseUrl: z
+    .string()
+    .default('')
+    .description(
+      '覆盖端点地址（填空表示用所选端点的默认地址）。仅在所有请求要走自建网关 / 代理时使用。',
+    ),
   maxAttempts: z.number().default(6).description('单个请求最多尝试几把 key'),
   acquireTimeoutMs: z.number().default(180_000).description('等待可用 key 的总预算（毫秒）'),
   requestTimeoutMs: z.number().default(60_000).description('单次上游请求超时（毫秒）'),
   rpmLimit: z
     .number()
-    .default(DEFAULT_RPM_LIMIT)
-    .description('每把 key 的本地 RPM 预限流上限；0 表示不限制'),
+    .default(-1)
+    .description(
+      '每把 key 的本地 RPM 预限流上限；0 表示不限制；-1（默认）表示按端点取默认值（中国站 2 / 国际站 3）。',
+    ),
   maxConcurrency: z.number().default(1).description('每把 key 的并发上限；1 表示串行（推荐）'),
 });
 
 type PluginConfig = {
+  endpoint: EndpointId;
   baseUrl: string;
   maxAttempts: number;
   acquireTimeoutMs: number;
@@ -129,12 +178,24 @@ const INERT_AUTH = {
 };
 
 export function apply(ctx: any, config: PluginConfig): void {
-  const resolved: PluginConfig = {
-    baseUrl: config?.baseUrl || DEFAULT_BASE_URL,
+  /**
+   * 配置文件里的端点（缺省 = 中国站，保证老用户升级后行为不变）。
+   *
+   * 运行期真正生效的端点是 `currentEndpoint`：它以凭据记录里的选择为准（用户在
+   * 设置卡片里切过），没有记录时回落到这里。
+   */
+  const configEndpoint = endpointFor(config?.endpoint);
+  /**
+   * config 里显式写的 `rpmLimit`（≥0 才算显式）；-1（默认）表示「按端点取默认值」。
+   */
+  const explicitRpmLimit =
+    typeof config?.rpmLimit === 'number' && config.rpmLimit >= 0 ? config.rpmLimit : null;
+
+  const resolved = {
+    baseUrl: typeof config?.baseUrl === 'string' ? config.baseUrl.trim() : '',
     maxAttempts: config?.maxAttempts ?? 6,
     acquireTimeoutMs: config?.acquireTimeoutMs ?? 120_000,
     requestTimeoutMs: config?.requestTimeoutMs ?? 60_000,
-    rpmLimit: config?.rpmLimit ?? 0,
     maxConcurrency: config?.maxConcurrency ?? 1,
   };
 
@@ -144,9 +205,34 @@ export function apply(ctx: any, config: PluginConfig): void {
     error: (message: string) => ctx.logger?.error?.(`sensenova-pool: ${message}`),
   };
 
+  /** 当前生效的端点。启动时取 config，装载凭据记录后可能被记录里的选择覆盖。 */
+  let currentEndpoint: SenseNovaEndpoint = configEndpoint;
+
+  /**
+   * 用户显式指定了 `baseUrl` 时不随端点切换（自建网关 / 代理的场景）。
+   *
+   * 这时「端点」只影响**内置基线与显示**，请求一律走用户给的地址。
+   */
+  const baseUrlPinned = resolved.baseUrl.length > 0;
+
+  /** 所选端点对应的上游根地址。 */
+  function upstreamFor(endpoint: SenseNovaEndpoint): string {
+    return baseUrlPinned ? resolved.baseUrl : endpoint.baseUrl;
+  }
+
+  /** 该端点下每把 key 的本地 RPM 上限（0 表示不限流）。 */
+  function rpmLimitFor(endpoint: SenseNovaEndpoint): number {
+    return explicitRpmLimit ?? defaultRpmLimitFor(endpoint.id);
+  }
+
   const catalog = new ModelCatalog();
+  // 回环服务按**端点**而不是地址区分：即使 baseUrl 被固定，切换端点也要换目录基线。
+  catalog.reset(currentEndpoint.id);
   const pool = new KeyPool([], {
-    rpmLimit: resolved.rpmLimit > 0 ? resolved.rpmLimit : null,
+    rpmLimit: (() => {
+      const limit = rpmLimitFor(currentEndpoint);
+      return limit > 0 ? limit : null;
+    })(),
     maxConcurrency: resolved.maxConcurrency,
   });
 
@@ -201,7 +287,7 @@ export function apply(ctx: any, config: PluginConfig): void {
   const shim: Shim = createShim({
     pool,
     catalog,
-    baseUrl: resolved.baseUrl,
+    baseUrl: upstreamFor(currentEndpoint),
     rotation: {
       maxAttempts: resolved.maxAttempts,
       acquireTimeoutMs: resolved.acquireTimeoutMs,
@@ -228,6 +314,19 @@ export function apply(ctx: any, config: PluginConfig): void {
         return { baseUrl: '', port: 0, apiKey: shim.token() };
       }
     },
+    upstreamEndpoint: (): EndpointStatus => ({
+      current: currentEndpoint.id,
+      upstream: shim.upstream(),
+      /** baseUrl 被 config 固定时，界面要提示「切端点只换目录/额度，不改地址」。 */
+      pinned: baseUrlPinned,
+      rpmLimit: rpmLimitFor(currentEndpoint),
+      options: ENDPOINTS.map((option) => ({
+        id: option.id,
+        label: option.label,
+        baseUrl: option.baseUrl,
+        active: option.id === currentEndpoint.id,
+      })),
+    }),
     models: () =>
       catalog.current().map((model) => {
         const limits = limitsFor(model);
@@ -245,7 +344,8 @@ export function apply(ctx: any, config: PluginConfig): void {
       }),
     providerId: PROVIDER_ID,
     providerName: PROVIDER_NAME,
-    baseUrl: resolved.baseUrl,
+    // 当前生效的上游根地址（不是回环地址）：用于展示与单把 key 探活。
+    baseUrl: shim.upstream(),
   };
 
   // ---------------------------------------------------------------- 凭据装载
@@ -273,6 +373,8 @@ export function apply(ctx: any, config: PluginConfig): void {
     modelLimits?: unknown;
     /** 对外暴露给其他本地服务的 API Key。 */
     externalKey?: unknown;
+    /** 用户在设置卡片里选定的上游端点（'cn' | 'intl'）；缺省表示从未切过。 */
+    endpoint?: unknown;
   }
 
   /**
@@ -361,6 +463,25 @@ export function apply(ctx: any, config: PluginConfig): void {
     return added;
   }
 
+  /**
+   * 应用一个"未来可能换端点"的选择（启动装载时用）。
+   *
+   * 与运行期的 {@link applyEndpoint} 同源，但这里不落盘、不刷新目录 —— 调用方
+   * （启动装载）随后会自己触发目录刷新，重复调用只会白白多打一次上游。
+   */
+  function adoptEndpoint(id: EndpointId): boolean {
+    if (id === currentEndpoint.id) return false;
+    currentEndpoint = endpointFor(id);
+    catalog.reset(currentEndpoint.id);
+    shim.setUpstream(upstreamFor(currentEndpoint));
+    pool.setRpmLimit((() => {
+      const limit = rpmLimitFor(currentEndpoint);
+      return limit > 0 ? limit : null;
+    })());
+    pool.resetHealth();
+    return true;
+  }
+
   /** 生成一把形如商汤 key 的对外密钥（只被本地 shim 校验，不发给上游）。 */
   function newExternalKey(): string {
     return `sk-dsh-${randomBytes(24).toString('hex')}`;
@@ -415,6 +536,10 @@ export function apply(ctx: any, config: PluginConfig): void {
       shim.setToken(externalKey);
     }
 
+    // 端点：记录里的选择优先于 config（用户在设置卡片里切过之后，重启也必须记住）。
+    // 记录里没有该字段 = 从未切过，保持 config 的端点，老用户行为不变。
+    if (isEndpointId(payload.endpoint)) adoptEndpoint(payload.endpoint);
+
     if (added > 0) logger.info(`已装载 ${added} 把 key`);
     return added;
   }
@@ -463,6 +588,8 @@ export function apply(ctx: any, config: PluginConfig): void {
         // 只存用户真正改过的模型；没有覆盖的模型不出现在这里。
         modelLimits: Object.fromEntries(modelLimits),
         externalKey,
+        // 端点选择：只存认得出的 id，避免把脏值写进凭据库。
+        endpoint: currentEndpoint.id,
       },
     }));
   }
@@ -692,7 +819,9 @@ export function apply(ctx: any, config: PluginConfig): void {
    */
   async function fetchCatalogFromUpstream(): Promise<void> {
     if (pool.size === 0) return;
-    const url = `${resolved.baseUrl.replace(/\/+$/, '')}/models`;
+    // 现取上游地址与基线：两次请求之间用户可能已经切换了端点。
+    const endpoint = currentEndpoint;
+    const url = `${shim.upstream().replace(/\/+$/, '')}/models`;
     const attempted = new Set<string>();
     for (let index = 0; index < Math.min(pool.size + 1, 4); index += 1) {
       let entry;
@@ -709,7 +838,9 @@ export function apply(ctx: any, config: PluginConfig): void {
         });
         if (response.ok) {
           const payload = await response.json();
-          const count = catalog.apply(payload);
+          // 请求在途时端点被切走：这份响应对新端点没有意义，丢弃。
+          if (currentEndpoint.id !== endpoint.id) return;
+          const count = catalog.apply(payload, builtinModelsFor(endpoint.id));
           pool.reportSuccess(entry);
           if (count > 0) {
             logger.info(`模型目录已更新：${count} 个模型`);
@@ -789,6 +920,39 @@ export function apply(ctx: any, config: PluginConfig): void {
     }
   };
 
+  /**
+   * 切换上游端点（中国站 ⇄ 国际站）。
+   *
+   * 这是「换一个站继续用」而不是「改个地址」：两个站的 key、模型、限流额度都
+   * 不同，所以四件事必须一起做，缺一件都会让状态变得自相矛盾：
+   *
+   *   1. **上游地址** —— 之后所有请求打到新站；
+   *   2. **模型目录** —— 退回新站的内置基线（旧站的模型列表在新站上多数是 404）；
+   *   3. **RPM 额度** —— 新站有自己的额度（中国站实测约 3 RPM，国际站另计）；
+   *   4. **key 健康状态** —— 冷却/失效是针对旧站记下的，带过去会让切站后几分钟
+   *      内一把 key 都用不了。
+   *
+   * 落盘顺序：先写凭据记录再刷新模型选择器 —— 刷新会让 DSH 立刻重读模型，
+   * 若此时记录还没写成功，用户会看到「切换了但重启又回到原来那个站」。
+   * 落盘失败不回滚：内存里已经切过去了，会话可用性优先，下次写入会一并带上。
+   */
+  const handleEndpointChanged = async (id: string): Promise<void> => {
+    if (!isEndpointId(id)) throw new Error(`未知端点：${id}`);
+    if (id === currentEndpoint.id) return;
+
+    adoptEndpoint(id);
+    logger.info(`已切换上游端点到「${currentEndpoint.label}」（${shim.upstream()}）`);
+
+    try {
+      await saveKeys();
+    } catch (error) {
+      logger.warn(`端点选择落盘失败（本次会话已生效）：${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    refreshCatalog();
+    void fetchCatalogFromUpstream();
+  };
+
   // 设置页：填 key（用户明确要求只在设置页填）。
   try {
     registerSettingsSection(ctx, {
@@ -810,6 +974,7 @@ export function apply(ctx: any, config: PluginConfig): void {
       onKeysChanged: handleKeysChanged,
       onModelsChanged: handleModelsChanged,
       onModelLimitsChanged: handleModelLimitsChanged,
+      onEndpointChanged: handleEndpointChanged,
       reload: async () => {
         // 手动重载：走同一套「装载并宣告」逻辑，因此在启动早期点它也不会把
         // 「还没读到」误当成「真的没有 key」而清空权威装载信号。

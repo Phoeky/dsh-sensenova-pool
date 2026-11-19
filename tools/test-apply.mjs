@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 集成测试：用桩件 + 假 cordis ctx 真实调用 apply()，验证启动时序。
  *
  * 重点覆盖上次真实加载失败的那条路径：
@@ -129,6 +129,60 @@ console.log('\n[apply] 凭据服务可用时能从记录里装载 key');
   await new Promise((r) => setTimeout(r, 400));
   const loaded = state.logs.info.find((m) => m.includes('已装载'));
   check('日志显示已装载 2 把 key', typeof loaded === 'string' && loaded.includes('2'), JSON.stringify(state.logs.info));
+  await state.effects[0]?.();
+}
+
+console.log('\n[apply] 端点：config 缺省为中国站，记录里的选择优先');
+{
+  // 1) config 不写 endpoint：默认中国站，老用户升级后地址不变。
+  const { ctx, state } = makeCtx();
+  apply(ctx, {});
+  await new Promise((r) => setTimeout(r, 400));
+  const models = () => globalThis.__capture.adapters.at(-1).profiles().get('sensenova-pool').piProvider.getModels().map((m) => m.id);
+  check('默认注册中国站模型', models().includes('deepseek-v4-flash'), JSON.stringify(models().slice(0, 3)));
+  await state.effects[0]?.();
+}
+
+{
+  // 2) config 写 endpoint: 'intl'：启动即按国际站注册。
+  const { ctx, state } = makeCtx();
+  apply(ctx, { endpoint: 'intl' });
+  await new Promise((r) => setTimeout(r, 400));
+  const models = () => globalThis.__capture.adapters.at(-1).profiles().get('sensenova-pool').piProvider.getModels().map((m) => m.id);
+  check('config intl → 注册国际站模型', models().every((id) => id.startsWith('sensenova-')) && models().length > 0, JSON.stringify(models()));
+  check('config intl → 不含中国站独有模型', !models().includes('deepseek-v4-flash'), JSON.stringify(models()));
+  check('启动无错误日志', state.logs.error.length === 0, JSON.stringify(state.logs.error));
+  await state.effects[0]?.();
+}
+
+{
+  // 3) 记录里存了 endpoint: 'intl'：覆盖 config 的默认值（重启后仍记得）。
+  const { ctx, state } = makeCtx();
+  state.services.credentials = {
+    async readRecord() {
+      return { kind: 'grant', payload: { keys: ['sk-storedkey0001'], endpoint: 'intl' } };
+    },
+    async modifyRecord() {},
+  };
+  apply(ctx, {});
+  await new Promise((r) => setTimeout(r, 400));
+  const models = globalThis.__capture.adapters.at(-1).profiles().get('sensenova-pool').piProvider.getModels().map((m) => m.id);
+  check('记录里的 intl 覆盖 config 默认值', models.length > 0 && models.every((id) => id.startsWith('sensenova-')), JSON.stringify(models));
+  check('装载后无错误日志', state.logs.error.length === 0, JSON.stringify(state.logs.error));
+  await state.effects[0]?.();
+}
+
+{
+  // 4) config 写死 baseUrl（自建网关）：端点仍决定目录，但地址不随端点改变。
+  const { ctx, state } = makeCtx();
+  state.services.credentials = { async readRecord() { return undefined; }, async modifyRecord() {} };
+  state.services.webServer = {
+    register() { return () => {}; },
+  };
+  apply(ctx, { endpoint: 'intl', baseUrl: 'https://gateway.example.com/v1' });
+  await new Promise((r) => setTimeout(r, 400));
+  const models = globalThis.__capture.adapters.at(-1).profiles().get('sensenova-pool').piProvider.getModels().map((m) => m.id);
+  check('baseUrl 固定时仍按端点选目录', models.every((id) => id.startsWith('sensenova-')), JSON.stringify(models));
   await state.effects[0]?.();
 }
 

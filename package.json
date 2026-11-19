@@ -2,7 +2,7 @@
   "name": "dsh-sensenova-pool",
   "displayName": "DSH SenseNova Key Pool",
   "description": "商汤日日新（SenseNova）多 Key 轮换池 — 填入多把 Key 即可零配置接入 DeepSeek Harness，遇 429 限流自动切换下一把 Key。",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Phoeky",
   "keywords": [
     "dsh-plugin",
@@ -10,6 +10,8 @@
     "deepseek",
     "sensenova",
     "日日新",
+    "sensenova.ai",
+    "国际站",
     "key-rotation",
     "key-pool",
     "rate-limit",
@@ -35,6 +37,7 @@
     "lib",
     "cordis.patch.yml",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "license": "MIT",

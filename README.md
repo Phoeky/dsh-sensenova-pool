@@ -47,6 +47,28 @@
 
 截图里的 `2/3 成功，1 次限流` 是真实发生的记录：这把 Key 触发过 1 次 429，被池子内部消化掉，上层没有收到过任何 429。
 
+### 🌏 可选端点：中国站 / 国际站
+
+商汤有**两个独立的 API 站**，模型、套餐、额度、key 都各自独立：
+
+| 端点 | 地址 | 适用 |
+|---|---|---|
+| 中国站（默认） | `https://token.sensenova.cn/v1` | 在商汤国内平台申请的 key |
+| 国际站 | `https://token.sensenova.ai/v1` | 在国际站申请的 key |
+
+在设置卡片最上方点一下就能切换，**无需重启 DSH**；所选端点会随 key 一起存进凭据库，
+重启后仍然记得。切换会连带做四件事，缺一件状态就会自相矛盾：
+
+1. **上游地址** —— 之后所有请求打到新站；
+2. **模型目录** —— 换回该站的内置基线，再自动用新 key 刷新（中国站独有 `deepseek-*` / `glm-*`，
+   国际站是 5 个 `sensenova-*` 模型，含 2 个生图模型，全部列出）；
+3. **限流额度** —— 两个站的 RPM 分开算（本地预限流默认中国站 2、国际站 3）；
+4. **key 健康状态** —— 冷却/失效是针对旧站记下的，切过去时一律清掉，不带着旧标记进新站。
+
+> ⚠️ 两个站的 key **互不通用**：拿国际站的 key 打中国站会得到 `401 Forbidden`。插件不会
+> 自动猜你在哪个站（猜错会把本来好用的 key 标成失效），所以端点必须自己选对 ——
+> 如果切过去后所有 key 都显示「已失效」，先检查是不是选错了站。
+
 ### 🧠 一次接入全部模型
 
 装好插件后，模型选择器里自动出现「商汤日日新（Key 轮换池）」分组，包含以下模型：
@@ -169,11 +191,16 @@ sk-cccccccccccccccccccccccccccccc
 
 点「**添加 Key**」。支持多种分隔方式，重复和无效项会被自动过滤。
 
-### 2. 选择模型
+### 2. 先确认端点
+
+卡片最上方的「上游端点」区显示当前打的是哪个站 —— 中国站还是国际站。点另一个按钮即可切换，
+下方会显示切换后的实际上游地址。**key 只在自己申请的那个站有效**，选错站会看到 401。
+
+### 3. 选择模型
 
 新建会话，在模型选择器里选「**商汤日日新（Key 轮换池）**」下的任意模型，然后正常对话即可。
 
-### 3. 需要时调整
+### 4. 需要时调整
 
 | 按钮 | 作用 |
 |---|---|
@@ -184,7 +211,7 @@ sk-cccccccccccccccccccccccccccccc
 | **复制**（接口区） | 复制接口地址 / 对外 API Key |
 | **模型勾选框** | 决定该模型是否出现在模型选择器里 |
 
-### 4. 接入其他服务
+### 5. 接入其他服务
 
 设置页「本地接口」区给出两样东西：
 
@@ -217,19 +244,48 @@ print(client.chat.completions.create(
 - id: llm-sensenova-pool
   name: dsh-sensenova-pool
   config:
-    rpmLimit: 2          # 每把 Key 的本地 RPM 预限流上限；0 = 关闭
+    endpoint: cn         # cn = 中国站，intl = 国际站；默认 cn。也可在设置卡片里切换
+    rpmLimit: 2          # 每把 Key 的本地 RPM 预限流上限；0 = 关闭，-1（默认）= 按端点取值
     maxAttempts: 6       # 单个请求最多尝试几把 Key
     maxConcurrency: 1    # 每把 Key 的并发上限；1 = 串行（推荐）
     acquireTimeoutMs: 180000
     requestTimeoutMs: 60000
-    baseUrl: https://token.sensenova.cn/v1
+    # baseUrl: https://token.sensenova.cn/v1   # 仅当所有请求要走自建网关时才填；填了就不随端点切换
 ```
 
-`rpmLimit: 2` 是默认值，基于实测（真实上限约 3 RPM）。**调大它不会提高吞吐，只会更容易被限流** —— 想提高吞吐应该增加 Key，而不是加压。
+`endpoint` 只决定**默认**端点：一旦在设置卡片里切过，以卡片里的选择（存在凭据库）为准，
+这样「重启后还记得你在哪个站」不需要改配置文件。`rpmLimit` 留默认值时按端点取
+（中国站 2、国际站 3），显式写数字则两个端点都用这个值。
+
+`rpmLimit` 的中国站默认值 2 基于实测（真实上限约 3 RPM）。**调大它不会提高吞吐，只会更容易被限流** —— 想提高吞吐应该增加 Key，而不是加压。
+
+**两个站的 Key 能混着用吗？** 不能。key 只在发卡的那个站有效，池子只打「当前选中的端点」，
+所以换站后要换用该站的 key（切站不会删除现有的 key，切回来它们还在）。
 
 ---
 
 ## 常见问题
+
+**切到国际站后所有 key 都显示「已失效」？**
+
+基本就是**选错站了**：国际站的 key 打中国站会返回 `401 Forbidden`，反之亦然。切回正确的站即可
+（切站时会清掉冷却/失效标记，所以切回来那些 key 会立刻恢复可用）。如果确认站选对了仍然 401，
+那才是 key 本身的问题。
+
+**国际站里怎么没有 `deepseek-v4-flash` / `glm-5.2`？**
+
+这些模型只在中国站提供。国际站目前有 5 个模型，且**全部列出、不做事先筛选**：
+
+| 模型 | 输出 | 对话实测（2026-11-19） |
+|---|---|---|
+| `sensenova-6.8-flash` | 文本 | ✅ 流式 / 非流式 / 图片输入 / 七档思考强度 |
+| `sensenova-6.8-flash-lite` | 文本 | ✅ 同上 |
+| `sensenova-6.7-flash-lite` | 文本 | ⚠️ 本 key 返回 404 `model is not found` |
+| `sensenova-u1-fast` | 图片 | ⚠️ 生图模型，对话接口 404 |
+| `sensenova-u1.5-lite` | 图片 | ⚠️ 生图模型，对话接口 404 |
+
+⚠️ 的那三个仍然展示：404 可能是套餐/灰度差异，隐藏会让有权限的人也选不到。选中后上游
+会如实报 404 —— 不想要的话在设置页取消勾选即可，可见性会持久化。
 
 **模型选择器里没有「商汤日日新」分组？**
 
@@ -400,6 +456,7 @@ Paste one or more SenseNova API keys in one place and use every SenseNova model 
 - **Never leaks a 429 upward** — when every key is exhausted the plugin reports `503 + Retry-After` so DSH backs off on its own
 - **All models, zero config** — a built-in catalogue works offline and refreshes from `/v1/models` once a valid key is present, so new models need no plugin upgrade
 - **Keys are masked** — only `sk-example...0001` style masks are ever displayed
+- **Two endpoints** — pick the China site (`token.sensenova.cn`) or the international site (`token.sensenova.ai`) from the settings card; switching also swaps the model list and the rate-limit budget, and the choice survives restarts
 
 ### Install
 
@@ -411,7 +468,7 @@ Add `"dsh-sensenova-pool"` to `dsh.profile.bundles` in your profile `package.jso
 
 ### Usage
 
-Open **Settings → dsh-sensenova-pool** (or the plugin card on the Plugins page), paste your keys, click **Add keys**, then pick any model under the "商汤日日新（Key 轮换池）" group in the model picker. The same page shows the local endpoint (base URL, port, API key) and lets you hide models from the picker.
+Open **Settings → dsh-sensenova-pool** (or the plugin card on the Plugins page), pick your endpoint (China site / international site — a key only works on the site that issued it), paste your keys, click **Add keys**, then pick any model under the "商汤日日新（Key 轮换池）" group in the model picker. The same page shows the local endpoint (base URL, port, API key) and lets you hide models from the picker.
 
 ### Troubleshooting
 

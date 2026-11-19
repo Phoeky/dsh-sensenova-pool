@@ -516,6 +516,65 @@ export class KeyPool {
     };
   }
 
+  /**
+   * 调整本地 RPM 预限流上限（运行期可改）。
+   *
+   * 为什么要它：两个端点（中国站 / 国际站）的限流额度并不相同，而插件允许在
+   * 设置卡片里切换端点。若不随之调整，换站只会换地址，额度仍压在旧值上。
+   * 传 null 表示不限制。
+   */
+  setRpmLimit(limit: number | null): void {
+    const next = limit !== null && limit > 0 ? limit : null;
+    if (next === this.rpmLimit) return;
+    this.rpmLimit = next;
+    // 窗口里的历史时间戳保持原样：它们代表真实发过的请求，放宽后立刻生效，
+    // 收紧后由 rpmBlockedUntil 自然消化。
+    this.notify();
+  }
+
+  get rpmLimitValue(): number | null {
+    return this.rpmLimit;
+  }
+
+  /** 调整每把 key 的并发上限（运行期可改）。 */
+  setMaxConcurrency(value: number): void {
+    const next = Math.max(1, Math.trunc(Number.isFinite(value) ? value : 1));
+    if (next === this.maxConcurrency) return;
+    this.maxConcurrency = next;
+    this.notify();
+  }
+
+  get maxConcurrencyValue(): number {
+    return this.maxConcurrency;
+  }
+
+  /**
+   * 清空冷却与失效标记，重新给每把 key 一次机会。
+   *
+   * 切换端点时使用：冷却/失效是针对旧端点记下的上游行为，新端点的额度与套餐
+   * 都不同，带着旧标记进新站会让刚切过去的几分钟内一把 key 都用不了。
+   * key 本身与累计统计（请求数 / 成功率）保留 —— 那些是事实，不该被抹掉。
+   */
+  resetHealth(): number {
+    let reset = 0;
+    for (const entry of this.entries) {
+      if (
+        entry.status === 'healthy' &&
+        entry.cooldownUntil === 0 &&
+        entry.consecutiveFailures === 0
+      ) {
+        continue;
+      }
+      entry.status = 'healthy';
+      entry.cooldownUntil = 0;
+      entry.consecutiveFailures = 0;
+      entry.lastError = '';
+      reset += 1;
+    }
+    if (reset > 0) this.notify();
+    return reset;
+  }
+
   /** 当前是否有任何 key 立即可用（不等待）。 */
   anyUsable(): boolean {
     const now = Date.now();

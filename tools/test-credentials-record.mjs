@@ -203,6 +203,36 @@ check('落盘过程没有 warn 日志', !warnings.some((m) => m.includes('keys r
   check('落盘带对外密钥', typeof last?.payload?.externalKey === 'string' && last.payload.externalKey.startsWith('sk-dsh-'), String(last?.payload?.externalKey));
 }
 
+// ---- 端点：切换后必须落盘（重启后仍记得选的是哪个站） ----------------------
+{
+  const before = written.length;
+  const switchRes = await fetch(`${origin}/plugins/dsh-sensenova-pool/keys`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-sensenova-pool-admin': adminKey },
+    body: JSON.stringify({ action: 'set-endpoint', id: 'intl' }),
+  });
+  check('POST set-endpoint → 200', switchRes.status === 200, `status=${switchRes.status}`);
+  const switchBody = await switchRes.json();
+  check('切换到国际站', switchBody.upstreamEndpoint?.current === 'intl', JSON.stringify(switchBody.upstreamEndpoint));
+  check('上游地址换成 token.sensenova.ai', switchBody.upstreamEndpoint?.upstream === 'https://token.sensenova.ai/v1', String(switchBody.upstreamEndpoint?.upstream));
+  check('切换触发了一次落盘', written.length === before + 1, `${before} → ${written.length}`);
+  check('切换后记录仍通过 schema 校验', validationError === '', validationError);
+  const last = written.at(-1)?.record;
+  check('payload.endpoint 写入 intl', last?.payload?.endpoint === 'intl', JSON.stringify(last?.payload?.endpoint));
+  check('切换不丢 key', Array.isArray(last?.payload?.keys) && last.payload.keys.length === 2, JSON.stringify(last?.payload?.keys));
+
+  // 模型目录也必须整批换成国际站的（不能还挂着中国站的 deepseek / glm）。
+  const adapter = globalThis.__capture.adapters.at(-1);
+  const intlModels = adapter.profiles().get('sensenova-pool').piProvider.getModels().map((m) => m.id);
+  check('切换后注册的是国际站模型', intlModels.length > 0 && intlModels.every((id) => id.startsWith('sensenova-')),
+    JSON.stringify(intlModels));
+  check('切换后不再注册中国站独有模型', !intlModels.includes('deepseek-v4-flash'), JSON.stringify(intlModels));
+
+  // 国家站 key 不该被当成「失效」永久拉黑：RPM 额度随端点调整。
+  const statusBody = await (await fetch(`${origin}/plugins/dsh-sensenova-pool/status`)).json();
+  check('国际站 RPM 额度为 3', statusBody.upstreamEndpoint?.rpmLimit === 3, String(statusBody.upstreamEndpoint?.rpmLimit));
+}
+
 // 关掉测试自己的 HTTP 服务。
 //
 // `server.close()` 只是停止接受新连接，**不会**关闭已经空闲的 keep-alive 连接：

@@ -32,9 +32,11 @@ export interface SenseNovaModel {
  * 内置基线目录（实测自 token.sensenova.cn）。
  *
  * contextWindow 严格取自 `context_length`，maxTokens 取自 `max_output_length`。
- * 刻意不写 `sensenova-u1-fast` / `sensenova-u1.5-lite`：它们实测返回 404
- * （`output_modalities: ["image"]`，属图像生成模型，不是对话模型），列出来只会
- * 让用户选到必然失败的模型。
+ * 不含 `sensenova-u1-fast` / `sensenova-u1.5-lite`：**中国站的 /v1/models 本来就不列
+ * 这两个生图模型**（基线只镜像上游列出的内容；国际站的目录里它们有，见
+ * {@link INTL_BUILTIN_MODELS}）。拿到 key 后刷新的目录同样不做任何筛选。
+ *
+ * 这是**中国站**的目录。国际站的目录不同，见 {@link INTL_BUILTIN_MODELS}。
  */
 export const BUILTIN_MODELS: readonly SenseNovaModel[] = [
   { id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', contextWindow: 1048576, maxTokens: 65536, supportsImages: false, reasoning: true },
@@ -52,7 +54,80 @@ export const BUILTIN_MODELS: readonly SenseNovaModel[] = [
   { id: 'sensenova-6.8-flash-lite', name: 'SenseNova 6.8 Flash-Lite', contextWindow: 262144, maxTokens: 65536, supportsImages: true, reasoning: true },
 ];
 
-export const DEFAULT_BASE_URL = 'https://token.sensenova.cn/v1';
+// ------------------------------------------------------------------ 端点
+
+/** 端点标识：'cn' = 中国站，'intl' = 国际站。 */
+export type EndpointId = 'cn' | 'intl';
+
+export interface SenseNovaEndpoint {
+  id: EndpointId;
+  /** 显示名（中英文一致：网页端点本身没有语言）。 */
+  label: string;
+  /** OpenAI 兼容根地址（含 `/v1`）。 */
+  baseUrl: string;
+}
+
+/**
+ * 可选的上游端点。
+ *
+ * 商汤分两个独立的 API 站点，**key 不通用**（在哪个站注册的 key 只能打哪个站），
+ * 所以端点必须是用户自己的选择，不能靠「挨个试」自动判定 —— 拿 A 站的 key 打
+ * B 站只会得到 401，而池子会把这把本来好用的 key 标成失效。
+ *
+ * 默认 'cn' 是刻意的：老用户的 key 与配置都指向中国站，升级后行为必须不变。
+ */
+export const ENDPOINTS: readonly SenseNovaEndpoint[] = [
+  { id: 'cn', label: '中国站', baseUrl: 'https://token.sensenova.cn/v1' },
+  { id: 'intl', label: '国际站', baseUrl: 'https://token.sensenova.ai/v1' },
+];
+
+export const DEFAULT_ENDPOINT_ID: EndpointId = 'cn';
+
+/** 端点 id 归一；认不出来时回落到默认端点。 */
+export function isEndpointId(value: unknown): value is EndpointId {
+  return value === 'cn' || value === 'intl';
+}
+
+/** 按 id 取端点定义；未知 id 回落到默认端点。 */
+export function endpointFor(id: unknown): SenseNovaEndpoint {
+  const found = ENDPOINTS.find((endpoint) => endpoint.id === id);
+  return found ?? (ENDPOINTS.find((endpoint) => endpoint.id === DEFAULT_ENDPOINT_ID) as SenseNovaEndpoint);
+}
+
+/** 默认上游根地址（中国站）。 */
+export const DEFAULT_BASE_URL = endpointFor(DEFAULT_ENDPOINT_ID).baseUrl;
+
+/**
+ * 国际站（token.sensenova.ai）的内置基线目录 —— 与上游 `/v1/models` 一一对应，
+ * **不做任何筛选**：上游列了什么，这里就有什么。
+ *
+ * 2026-11-19 用真实国际站 key 实测的可用性（供参考，不决定是否展示）：
+ *
+ * - `sensenova-6.8-flash` / `sensenova-6.8-flash-lite` —— 对话、流式、图片输入、
+ *   七档 `reasoning_effort` 全部 200。
+ * - `sensenova-6.7-flash-lite` —— `/v1/models` 声明 `output_modalities: ["text"]`（是多模态
+ *   对话模型），但本 key 对话请求多次返回 404 `model is not found`。仍然列出：
+ *   可能是该 key 的套餐/灰度差异，隐藏它会让有权限的用户也选不到。选中后上游会
+ *   如实报 404，在设置页取消勾选即可隐藏。
+ * - `sensenova-u1-fast` / `sensenova-u1.5-lite` —— 生图模型（`output_modalities: ["image"]`），
+ *   对话接口返回 404。同样列出，理由同上。
+ *
+ * 窗口沿用上游报的 262144：国际站**没有**国内站 issue #4 那种「报小 4 倍」的实测
+ * 证据，因此不设 `contextWindowOverridesUpstream`，以拿到 key 后刷新的上游值为准。
+ */
+export const INTL_BUILTIN_MODELS: readonly SenseNovaModel[] = [
+  { id: 'sensenova-6.8-flash', name: 'SenseNova 6.8 Flash', contextWindow: 262144, maxTokens: 65536, supportsImages: true, reasoning: true },
+  { id: 'sensenova-6.8-flash-lite', name: 'SenseNova 6.8 Flash-Lite', contextWindow: 262144, maxTokens: 65536, supportsImages: true, reasoning: true },
+  { id: 'sensenova-6.7-flash-lite', name: 'SenseNova 6.7 Flash-Lite', contextWindow: 262144, maxTokens: 65536, supportsImages: true, reasoning: true },
+  // 生图模型：上游列在 /v1/models 里，这里也照常列出（对话接口会 404）。
+  { id: 'sensenova-u1-fast', name: 'SenseNova U1 Fast', contextWindow: 262144, maxTokens: 65536, supportsImages: false, reasoning: true },
+  { id: 'sensenova-u1.5-lite', name: 'SenseNova U1.5 Lite', contextWindow: 262144, maxTokens: 65536, supportsImages: false, reasoning: true },
+];
+
+/** 该端点的内置基线目录。 */
+export function builtinModelsFor(endpointId: unknown): readonly SenseNovaModel[] {
+  return endpointFor(endpointId).id === 'intl' ? INTL_BUILTIN_MODELS : BUILTIN_MODELS;
+}
 
 // --------------------------------------------------------- 推理档位（issue #3）
 
@@ -316,8 +391,14 @@ function resolveContextWindow(raw: RawModelEntry, baseline: SenseNovaModel | und
  * 把 `/v1/models` 的原始响应解析成目录。
  *
  * 宽容解析：字段缺失就回落到基线/默认值，任何一条坏数据都不应该让整个目录失败。
+ *
+ * `baselines` 由调用方按**当前端点**给出：两个站的模型集合不同，拿中国站的基线
+ * 去解析国际站的响应，会让国际站缺失的模型也套上中国站的窗口/上限。
  */
-export function parseModelCatalog(payload: unknown): SenseNovaModel[] {
+export function parseModelCatalog(
+  payload: unknown,
+  baselines: readonly SenseNovaModel[] = BUILTIN_MODELS,
+): SenseNovaModel[] {
   const data = (payload as { data?: unknown })?.data;
   if (!Array.isArray(data)) return [];
   const out: SenseNovaModel[] = [];
@@ -326,12 +407,10 @@ export function parseModelCatalog(payload: unknown): SenseNovaModel[] {
     if (!id) continue;
     const modalities = Array.isArray(raw.input_modalities) ? raw.input_modalities : [];
     const features = Array.isArray(raw.supported_features) ? raw.supported_features : [];
-    const baseline = BUILTIN_MODELS.find((model) => model.id === id);
-    // 只保留文本输出模型：图像生成模型（output_modalities 无 text）无法用于对话。
-    const outputs = Array.isArray((raw as { output_modalities?: unknown }).output_modalities)
-      ? ((raw as { output_modalities: unknown[] }).output_modalities as unknown[])
-      : undefined;
-    if (outputs && outputs.length > 0 && !outputs.includes('text')) continue;
+    const baseline = baselines.find((model) => model.id === id);
+    // 上游 /v1/models 列什么就收什么，**不按输出模态筛掉生图模型**：用户明确要求
+    // 「模型全放出来」。生图模型在对话接口上会如实返回 404，比在列表里凭空消失
+    // 更容易理解；不想要的话在设置页取消勾选即可（可见性会持久化）。
     out.push({
       id,
       name: typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : id,
@@ -399,6 +478,9 @@ export function extractErrorMessage(body: string): string {
  *
  * 关键判定（实测商汤行为）：
  * - 429 `ModelAccountTpmRateLimitExceeded` → 限流，**换 key 重试**。
+ * - 401 `{"code":16,"message":"Forbidden"}` → 该 key 不属于**这个端点**。实测国际站
+ *   key 打中国站 `token.sensenova.cn` 就是这条；两个站的 key 互不通用，因此用户
+ *   选错端点时应当直接看到鉴权失败，而不是被当成「限流」无限重试。
  * - 401/403 `permission_denied_error` (code 7) → 该 key 对该模型无权限。
  *   注意：这**不代表 key 失效**，只代表这个模型不在当前套餐里；因此归类为
  *   `client`（不冷却、不换 key 空转），而不是 `invalid_credential`。

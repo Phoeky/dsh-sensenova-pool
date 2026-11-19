@@ -34,6 +34,19 @@ const modelRows = [
 ];
 const modelsChanged = [];
 const limitsChanged = [];
+const endpointChanged = [];
+// 端点状态是**可变**的：切端点后 /status 与 /test 都应看到新值。
+const endpointState = {
+  current: 'cn',
+  upstream: 'https://token.sensenova.cn/v1',
+  pinned: false,
+  rpmLimit: 2,
+  options: [
+    { id: 'cn', label: '中国站', baseUrl: 'https://token.sensenova.cn/v1', active: true },
+    { id: 'intl', label: '国际站', baseUrl: 'https://token.sensenova.ai/v1', active: false },
+  ],
+};
+const ENDPOINTS = endpointState.options.map((o) => ({ id: o.id, label: o.label, baseUrl: o.baseUrl }));
 registerKeyRoutes(ctx, {
   status: {
     pool: () => pool.snapshot(),
@@ -44,7 +57,16 @@ registerKeyRoutes(ctx, {
     models: () => modelRows.map((row) => ({ ...row })),
     providerId: 'sensenova-pool',
     providerName: '商汤日日新（Key 轮换池）',
-    baseUrl: 'https://token.sensenova.cn/v1',
+    get baseUrl() {
+      return endpointState.upstream;
+    },
+    upstreamEndpoint: () => ({
+      current: endpointState.current,
+      upstream: endpointState.upstream,
+      pinned: endpointState.pinned,
+      rpmLimit: endpointState.rpmLimit,
+      options: ENDPOINTS.map((option) => ({ ...option, active: option.id === endpointState.current })),
+    }),
   },
   pool,
   logger: { info() {}, warn() {}, error() {} },
@@ -66,6 +88,19 @@ registerKeyRoutes(ctx, {
     if (limits.contextWindow !== undefined) row.contextWindow = limits.contextWindow;
     if (limits.maxTokens !== undefined) row.maxTokens = limits.maxTokens;
     row.overridden = true;
+  },
+  onEndpointChanged: async (id) => {
+    endpointChanged.push(id);
+    const target = ENDPOINTS.find((option) => option.id === id);
+    if (target === undefined) throw new Error(`未知端点：${id}`);
+    endpointState.current = id;
+    endpointState.upstream = target.baseUrl;
+    endpointState.rpmLimit = id === 'intl' ? 3 : 2;
+    // 换站 = 换模型目录：模拟成国际站只有 sensenova 系列。
+    if (id === 'intl') {
+      modelRows.length = 0;
+      modelRows.push({ id: 'sensenova-6.8-flash', name: 'SenseNova 6.8 Flash', contextWindow: 262144, maxTokens: 65536, defaults: { contextWindow: 262144, maxTokens: 65536 }, overridden: false, enabled: true });
+    }
   },
   reload: async () => {},
   fetchCatalog: async () => {},
@@ -271,6 +306,54 @@ console.log('\n[route] 模型窗口/输出上限（issue #4）');
   check('恢复默认时两字段都未传',
     limitsChanged.at(-1)?.limits?.contextWindow === undefined && limitsChanged.at(-1)?.limits?.maxTokens === undefined,
     JSON.stringify(limitsChanged.at(-1)));
+}
+
+console.log('\n[route] 上游端点切换');
+{
+  const base = '/plugins/dsh-sensenova-pool/keys';
+  const admin = { 'x-sensenova-pool-admin': adminKey };
+
+  const initial = await get('/plugins/dsh-sensenova-pool/status');
+  check('默认端点是中国站', initial.body.upstreamEndpoint?.current === 'cn', JSON.stringify(initial.body.upstreamEndpoint));
+  check('下发两个可选端点', initial.body.upstreamEndpoint?.options?.length === 2, JSON.stringify(initial.body.upstreamEndpoint?.options));
+  check('国际站地址是 token.sensenova.ai',
+    initial.body.upstreamEndpoint?.options?.some((o) => o.id === 'intl' && o.baseUrl === 'https://token.sensenova.ai/v1'),
+    JSON.stringify(initial.body.upstreamEndpoint?.options));
+  check('上游地址不是回环地址', initial.body.baseUrl === 'https://token.sensenova.cn/v1', String(initial.body.baseUrl));
+
+  const noToken = await post(base, { action: 'set-endpoint', id: 'intl' });
+  check('无令牌切换端点被拒 403', noToken.status === 403, String(noToken.status));
+  check('被拒后仍是 cn', endpointChanged.length === 0, JSON.stringify(endpointChanged));
+
+  const unknown = await post(base, { action: 'set-endpoint', id: 'moon' }, admin);
+  check('未知端点 → 400', unknown.status === 400, String(unknown.status));
+  check('错误信息列出可选项', typeof unknown.body.error === 'string' && unknown.body.error.includes('cn'), String(unknown.body.error));
+
+  const empty = await post(base, { action: 'set-endpoint' }, admin);
+  check('缺 id → 400', empty.status === 400, String(empty.status));
+
+  const switched = await post(base, { action: 'set-endpoint', id: 'intl' }, admin);
+  check('切换国际站 → 200', switched.status === 200, JSON.stringify(switched.body).slice(0, 200));
+  check('回调收到 intl', endpointChanged.at(-1) === 'intl', JSON.stringify(endpointChanged));
+  check('响应里当前端点已切换', switched.body.upstreamEndpoint?.current === 'intl', JSON.stringify(switched.body.upstreamEndpoint));
+  check('模型目录整批换成国际站', switched.body.models?.length === 1 && switched.body.models[0].id === 'sensenova-6.8-flash',
+    JSON.stringify(switched.body.models?.map((m) => m.id)));
+  check('RPM 额度随端点调整', switched.body.upstreamEndpoint?.rpmLimit === 3, String(switched.body.upstreamEndpoint?.rpmLimit));
+
+  const after = await get('/plugins/dsh-sensenova-pool/status');
+  check('/status 反映新端点', after.body.upstreamEndpoint?.current === 'intl', JSON.stringify(after.body.upstreamEndpoint));
+  check('/status 的上游地址已更新', after.body.baseUrl === 'https://token.sensenova.ai/v1', String(after.body.baseUrl));
+
+  // 切回中国站，方便后续断言（并顺带验证可来回切）。
+  await post(base, { action: 'set-endpoint', id: 'cn' }, admin);
+  const back = await get('/plugins/dsh-sensenova-pool/status');
+  check('可以切回中国站', back.body.upstreamEndpoint?.current === 'cn', JSON.stringify(back.body.upstreamEndpoint));
+  // 模型目录在测试桩里只重置不回填，这里补回后续用例需要的两条。
+  modelRows.length = 0;
+  modelRows.push(
+    { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', contextWindow: 1048576, maxTokens: 65536, defaults: { contextWindow: 1048576, maxTokens: 65536 }, overridden: false, enabled: true },
+    { id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1048576, maxTokens: 131072, defaults: { contextWindow: 1048576, maxTokens: 131072 }, overridden: false, enabled: true },
+  );
 }
 
 console.log('\n[route] 未知操作与错误处理');

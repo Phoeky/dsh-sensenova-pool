@@ -21,7 +21,13 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { Readable } from 'node:stream';
 
-import { BUILTIN_MODELS, DEFAULT_BASE_URL, parseModelCatalog, type SenseNovaModel } from './catalog.js';
+import {
+  BUILTIN_MODELS,
+  DEFAULT_BASE_URL,
+  builtinModelsFor,
+  parseModelCatalog,
+  type SenseNovaModel,
+} from './catalog.js';
 import { KeyPool } from './keypool.js';
 import { DEFAULT_ROTATION, requestWithRotation, type AttemptLog, type RotationOptions } from './rotate.js';
 import { sanitizeChatRequest } from './sanitize.js';
@@ -52,9 +58,13 @@ export class ModelCatalog {
     };
   }
 
-  /** 用一次成功的 `/v1/models` 响应替换目录；空结果视为失败（不覆盖基线）。 */
-  apply(payload: unknown): number {
-    const parsed = parseModelCatalog(payload);
+  /**
+   * 用一次成功的 `/v1/models` 响应替换目录；空结果视为失败（不覆盖基线）。
+   *
+   * `baselines` 必须与**发起这次请求的端点**一致（见 {@link builtinModelsFor}）。
+   */
+  apply(payload: unknown, baselines: readonly SenseNovaModel[] = BUILTIN_MODELS): number {
+    const parsed = parseModelCatalog(payload, baselines);
     if (parsed.length === 0) return 0;
     this.models = parsed;
     this.lastFetchedAt = Date.now();
@@ -65,6 +75,19 @@ export class ModelCatalog {
   fail(message: string): void {
     this.lastError = message;
   }
+
+  /**
+   * 丢开已拉取的目录，退回某个端点的内置基线。
+   *
+   * 切换端点时必须调用：上一个站拉回来的模型列表对新站毫无意义（国际站没有
+   * `glm-5.2`、`deepseek-v4-flash` 这些模型），继续展示只会让用户选到必然 404
+   * 的模型。退回基线后，新站的有效 key 会立刻触发一次刷新。
+   */
+  reset(endpointId: string): void {
+    this.models = [...builtinModelsFor(endpointId)];
+    this.lastFetchedAt = 0;
+    this.lastError = '';
+  }
 }
 
 // ---------------------------------------------------------------------- shim
@@ -72,6 +95,7 @@ export class ModelCatalog {
 export interface ShimOptions {
   pool: KeyPool;
   catalog: ModelCatalog;
+  /** 上游 OpenAI 兼容根地址（含 `/v1`）。 */
   baseUrl: string;
   rotation?: Partial<RotationOptions>;
   logger?: { info(msg: string): void; warn(msg: string): void; error(msg: string): void };
@@ -100,6 +124,15 @@ export interface Shim {
    * 请求不该因此 401。持久化的密钥在启动装载完成后才拿到，正是走这条路径。
    */
   setToken(next: string): void;
+  /** 当前上游根地址（切换端点后即为新值）。 */
+  upstream(): string;
+  /**
+   * 切换上游端点（中国站 ⇄ 国际站）。
+   *
+   * 只换「请求发往哪里」：回环端口、对外密钥、key 池都不动。切换后是否重置目录
+   * 由调用方决定（它才知道新端点该退回哪套基线）。
+   */
+  setUpstream(next: string): void;
   close(): Promise<void>;
 }
 
@@ -113,6 +146,8 @@ interface OpenAIChatBody {
 export function createShim(options: ShimOptions): Shim {
   const { pool, catalog } = options;
   const rotation: RotationOptions = { ...DEFAULT_ROTATION, ...options.rotation };
+  // 上游地址可变：用户在设置卡片里切换端点后立刻生效，无需重启 DSH。
+  let upstreamBaseUrl = options.baseUrl;
   // 每进程随机共享密钥：DSH 用 Bearer 带上它，别的本地进程猜不到。
   // 启动装载完成后会被凭据库里那把持久化密钥替换（见 setToken），以便外部服务
   // 配置一次就能长期使用。
@@ -206,7 +241,8 @@ export function createShim(options: ShimOptions): Shim {
     }
 
     const wantsStream = body.stream === true;
-    const upstreamUrl = `${options.baseUrl.replace(/\/+$/, '')}/chat/completions`;
+    // 每次请求现算：端点可能在两次请求之间被切换。
+    const upstreamUrl = `${upstreamBaseUrl.replace(/\/+$/, '')}/chat/completions`;
 
     // 关键：轮换发生在「拿到首个响应」之前，因此对上层完全透明。
     const controller = new AbortController();
@@ -311,6 +347,12 @@ export function createShim(options: ShimOptions): Shim {
     baseUrl,
     port: () => listeningAddress().port,
     token: () => primaryToken,
+    upstream: () => upstreamBaseUrl,
+    setUpstream: (next: string) => {
+      if (typeof next !== 'string' || next.length === 0 || next === upstreamBaseUrl) return;
+      upstreamBaseUrl = next;
+      options.logger?.info(`sensenova-pool: 上游端点已切换为 ${next}`);
+    },
     setToken: (next: string) => {
       if (typeof next !== 'string' || next.length < 8 || next === primaryToken) return;
       primaryToken = next;

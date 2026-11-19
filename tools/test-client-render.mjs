@@ -103,6 +103,16 @@ for (const row of registered) {
   check(`${row.options.name} 含模型区块`, text.includes('modelsTitle'));
 }
 
+console.log('\n[render] 端点区（无状态时不出错）');
+{
+  // 初始状态下 upstream 为 undefined：端点区应整块不渲染，而不是崩掉。
+  const row = byName('settings.section');
+  const props = row.options.inject();
+  const tree = JSON.stringify(expand(row.Component({ ...props, view: 'full', t: props.t })));
+  check('没有端点状态时也能渲染', tree.length > 0);
+  check('没有端点状态时不渲染端点区', !tree.includes('endpoint-pick'));
+}
+
 console.log('\n[render] 摘要视图');
 {
   const row = byName('plugins.bundle.config');

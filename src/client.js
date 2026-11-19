@@ -247,7 +247,7 @@ window.__ModuleLoader__.load({
     // ------------------------------------------------------------------ 卡片
 
     /**
-     * 管理卡片：对外接口 + Key 池 + 模型可见性。
+     * 管理卡片：上游端点 + 对外接口 + Key 池 + 模型可见性。
      *
      * @param props.t 文案读取器（宿主 locale 绑定）。
      * @param props.variant 'section' 时渲染页面标题（设置分区里需要），'card' 时不渲染。
@@ -262,6 +262,8 @@ window.__ModuleLoader__.load({
       const [catalog, setCatalog] = React.useState(undefined);
       const [models, setModels] = React.useState([]);
       const [endpoint, setEndpoint] = React.useState(undefined);
+      // 上游端点（中国站 / 国际站）：{ current, upstream, pinned, rpmLimit, options[] }
+      const [upstream, setUpstream] = React.useState(undefined);
       const [adminKey, setAdminKey] = React.useState(undefined);
       const [tested, setTested] = React.useState({});
       const [copied, setCopied] = React.useState('');
@@ -279,6 +281,7 @@ window.__ModuleLoader__.load({
             setCatalog(status.catalog);
             if (Array.isArray(status.models)) setModels(status.models);
             if (status.endpoint) setEndpoint(status.endpoint);
+            if (status.upstreamEndpoint) setUpstream(status.upstreamEndpoint);
             if (typeof status.adminKey === 'string') setAdminKey(status.adminKey);
           }
           setError(undefined);
@@ -343,6 +346,16 @@ window.__ModuleLoader__.load({
           return value.ok ? t('testOk', { ms: String(value.latencyMs) }) : t('testFail', { message: String(value.message).slice(0, 80) });
         });
 
+      // 切换上游端点。key 在两个站之间不通用，所以这里不做任何自动探测 —— 换站后
+      // 新站上没有的 key 会如实显示「已失效」，用户据此判断是不是选错了站。
+      const selectEndpoint = (id) =>
+        run('endpoint', async () => {
+          const value = await postJson(`${BASE}/keys`, { action: 'set-endpoint', id }, adminKey);
+          if (value && value.upstreamEndpoint) setUpstream(value.upstreamEndpoint);
+          const chosen = (value?.upstreamEndpoint?.options || []).find((option) => option.active);
+          return t('endpointSwitched', { label: chosen ? chosen.label : id });
+        });
+
       const toggleModel = (id, enabled) =>
         run('model', async () => {
           await postJson(`${BASE}/keys`, { action: 'set-model', id, enabled }, adminKey);
@@ -399,6 +412,40 @@ window.__ModuleLoader__.load({
       return h('div', { style: rootStyle }, [
         variant === 'section' ? h('h2', { key: 'title', style: pageTitleStyle }, t('nav')) : null,
         h('p', { key: 'hint', style: hintStyle }, t('hint')),
+
+        // ---- 上游端点：中国站 / 国际站 -------------------------------------
+        //
+        // 两个站的 key 互不通用，所以这是一个「你得自己选对」的开关，而不是自动
+        // 探测。放在最上面：填 key 之前就该先确认打的是哪个站。
+        upstream && Array.isArray(upstream.options) && upstream.options.length > 0
+          ? h('div', { key: 'endpoint-pick', style: { ...blockStyle, paddingTop: 0, borderTop: 'none' } }, [
+              h('h3', { key: 'title', style: blockTitleStyle }, t('epTitle')),
+              h('p', { key: 'hint', style: hintStyle }, t('epHint')),
+              h(
+                'div',
+                { key: 'options', style: { display: 'flex', flexWrap: 'wrap', gap: 8 } },
+                upstream.options.map((option) =>
+                  h(
+                    'button',
+                    {
+                      key: option.id,
+                      type: 'button',
+                      // 选中项用主按钮样式；其余是普通按钮。
+                      style: option.active ? buttonPrimaryStyle : buttonStyle,
+                      disabled: busy || option.active === true,
+                      title: option.baseUrl,
+                      onClick: () => selectEndpoint(option.id),
+                    },
+                    option.active ? `✓ ${option.label}` : option.label,
+                  ),
+                ),
+              ),
+              h('p', { key: 'addr', style: { ...codeStyle, margin: 0 } }, `${t('epUpstream')}：${upstream.upstream || '—'}`),
+              upstream.pinned
+                ? h('p', { key: 'pinned', style: { ...hintStyle, color: 'var(--dsw-alias-label-warning, #bf8700)' } }, t('epPinned'))
+                : null,
+            ])
+          : null,
 
         summary
           ? h(
@@ -673,6 +720,11 @@ window.__ModuleLoader__.load({
       copy: 'Copy',
       copied: 'Copied',
       copyFailed: 'Copy failed — select the text and copy manually.',
+      epTitle: 'Endpoint',
+      epHint: 'The China site and the international site are separate services: a key only works on the site that issued it. Switching swaps the upstream URL, the model list and the rate-limit budget.',
+      epUpstream: 'Upstream',
+      epPinned: 'baseUrl is fixed in the plugin config — switching only changes the model list and the rate-limit budget, not the address.',
+      endpointSwitched: 'Switched to {label}',
       keysTitle: 'Key pool',
       modelsTitle: 'Models in the picker',
       modelsHint: '{count} of {total} models are shown. Context window and max output are editable per model — clear a field to restore the default.',
@@ -728,6 +780,11 @@ window.__ModuleLoader__.load({
       copy: '复制',
       copied: '已复制',
       copyFailed: '复制失败，请手动选中文本复制。',
+      epTitle: '上游端点',
+      epHint: '中国站与国际站是两个独立的服务，key 只在发卡的那个站有效。切换会同时换掉上游地址、模型列表与限流额度。',
+      epUpstream: '上游地址',
+      epPinned: '插件配置里写死了 baseUrl —— 切换只换模型列表与限流额度，不改请求地址。',
+      endpointSwitched: '已切换到{label}',
       keysTitle: 'Key 池',
       modelsTitle: '下拉中的模型',
       modelsHint: '共 {total} 个模型，当前展示 {count} 个。窗口与最大输出可逐模型修改（清空输入框即恢复默认）。',

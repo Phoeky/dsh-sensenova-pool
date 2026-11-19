@@ -168,7 +168,7 @@ console.log('\n[9] 错误分类矩阵');
   check('Retry-After 秒 → ms', classifyError(429, '{}', '12').retryAfterMs === 12000);
 }
 
-console.log('\n[10] 目录解析：过滤图像生成模型，保留上下文窗口');
+console.log('\n[10] 目录解析：上游列出的模型全部保留，并保留上下文窗口');
 {
   const parsed = parseModelCatalog({
     data: [
@@ -177,7 +177,9 @@ console.log('\n[10] 目录解析：过滤图像生成模型，保留上下文窗
       { id: 'sensenova-6.8-flash-lite', context_length: 262144, max_output_length: 65536, input_modalities: ['text', 'image'], output_modalities: ['text'] },
     ],
   });
-  check('过滤掉图像生成模型', parsed.length === 2, `got ${parsed.length}`);
+  // 「模型全放出来」：上游 /v1/models 列出的生图模型也照常保留，不再按输出模态筛选。
+  check('生图模型不再被过滤', parsed.length === 3, `got ${parsed.length}`);
+  check('生图模型按 id 保留', parsed.some((m) => m.id === 'sensenova-u1-fast'), JSON.stringify(parsed.map((m) => m.id)));
   check('保留 1M 上下文', parsed[0].contextWindow === 1048576);
   check('识别图片输入', parsed.find((m) => m.id === 'sensenova-6.8-flash-lite')?.supportsImages === true);
   check('缺 name 时回落 id', parsed.find((m) => m.id === 'sensenova-6.8-flash-lite')?.name === 'sensenova-6.8-flash-lite');
