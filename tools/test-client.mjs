@@ -10,7 +10,7 @@ let pass = 0, fail = 0;
 const check = (n, c, d = '') => { c ? (pass++, console.log(`  PASS  ${n}`)) : (fail++, console.log(`  FAIL  ${n}${d ? ' — ' + d : ''}`)); };
 
 const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
-const clientPath = pkg.exports['./client'].replace(/^\.\//, '');
+const clientPath = process.argv.includes('--source') ? 'src/client.js' : pkg.exports['./client'].replace(/^\.\//, '');
 
 console.log('\n[client] 打包契约');
 check('exports["./client"] 已声明', typeof pkg.exports['./client'] === 'string');
@@ -63,13 +63,14 @@ check('保存前只改草稿（value 受控）', code.includes('value: limitWind
 check('输入框是文本框（才输得进 1M / 128K）', code.includes("inputMode: 'numeric'") && !code.includes("type: 'number'"));
 check('提示里说明支持 1M / 128K', code.includes('1M / 128K'));
 
-console.log('\n[client] 上游端点选择');
-check('调用 set-endpoint 接口', code.includes("action: 'set-endpoint'"));
-check('从 /status 取端点状态', code.includes('status.upstreamEndpoint'));
-check('渲染两个端点的切换按钮', code.includes('upstream.options.map'));
+console.log('\n[client] 双站独立管理');
+check('不调用 set-endpoint 接口', !code.includes("action: 'set-endpoint'"));
+check('从 /status 取只读上游状态', code.includes('status.upstreamEndpoint'));
+check('Tab 只更新本地可见站点', code.includes('onClick: () => setSite(option.id)'));
+check('每站独立挂载管理卡', code.includes('h(KeyCard, { key: option.id, t, base: option.base })'));
+check('隐藏而非卸载另一站卡片', code.includes('hidden: site !== option.id'));
 check('显示当前上游地址', code.includes('epUpstream'));
-check('baseUrl 被固定时给出提示', code.includes('epPinned'));
-check('有切换成功提示文案', code.includes("t('endpointSwitched'"));
+check('文案说明 Key 池独立与两站同时可用', code.includes('Key 池独立') && code.includes('同时可用') && code.includes('不是切换上游'));
 
 console.log('\n[client] 文案键完整性');
 {
@@ -89,13 +90,11 @@ console.log('\n[client] 文案键完整性');
 }
 
 console.log('\n[client] 与宿主路由的契约');
-// 客户端用 BASE 常量 + 后缀拼 URL（比散落的字面量更不易写错），因此这里
-// 同时校验 BASE 与各后缀都出现。
-const baseMatch = code.match(/const BASE = '([^']+)'/);
-check('定义了路由 BASE', Boolean(baseMatch), String(baseMatch?.[1]));
-check('BASE 指向本插件路由前缀', baseMatch?.[1] === '/plugins/dsh-sensenova-pool', String(baseMatch?.[1]));
+// 每张管理卡只使用所属站点的固定 base 拼接管理路由。
+check('中国站兼容旧路由', code.includes("id: 'cn', base: '/plugins/dsh-sensenova-pool'"));
+check('国际站使用独立路由', code.includes("id: 'intl', base: '/plugins/dsh-sensenova-pool/intl'"));
 for (const suffix of ['/status', '/keys', '/test']) {
-  check(`请求 BASE${suffix}`, code.includes(`\${BASE}${suffix}`), suffix);
+  check(`请求站点 base${suffix}`, code.includes(`\${base}${suffix}`), suffix);
 }
 check('写操作带令牌头', code.includes('x-sensenova-pool-admin'));
 check('GET 用 same-origin 凭据', code.includes("credentials: 'same-origin'"));

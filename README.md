@@ -21,6 +21,8 @@
 
 ---
 
+> **1.2.0**：中国站和国际站现已完全隔离，各自拥有 Key 池与模型分组。旧国际站会话升级后请重新选择「商汤日日新 · 国际站」。
+
 ## 功能
 
 ### 🔑 多 Key 轮换池
@@ -47,31 +49,33 @@
 
 截图里的 `2/3 成功，1 次限流` 是真实发生的记录：这把 Key 触发过 1 次 429，被池子内部消化掉，上层没有收到过任何 429。
 
-### 🌏 可选端点：中国站 / 国际站
+### 🌏 双站隔离：中国站 / 国际站（未发布）
 
-商汤有**两个独立的 API 站**，模型、套餐、额度、key 都各自独立：
+中国站与国际站是**两个同时工作的独立实例**，不再共用一个可切换上游的池子：
 
-| 端点 | 地址 | 适用 |
-|---|---|---|
-| 中国站（默认） | `https://token.sensenova.cn/v1` | 在商汤国内平台申请的 key |
-| 国际站 | `https://token.sensenova.ai/v1` | 在国际站申请的 key |
+| 站点 | 上游地址 | provider | 模型选择器显示 |
+|---|---|---|---|
+| 中国站 | `https://token.sensenova.cn/v1` | `sensenova-pool` | 商汤日日新 · 中国站 |
+| 国际站 | `https://token.sensenova.ai/v1` | `sensenova-pool-intl` | 商汤日日新 · 国际站 |
 
-在设置卡片最上方点一下就能切换，**无需重启 DSH**；所选端点会随 key 一起存进凭据库，
-重启后仍然记得。切换会连带做四件事，缺一件状态就会自相矛盾：
+设置页的「中国站 / 国际站」Tab **只切换管理视图**，不会切换请求上游，不会停用另一站，也不会清掉另一站的状态。两站可以同时对话、同时服务外部客户端。
 
-1. **上游地址** —— 之后所有请求打到新站；
-2. **模型目录** —— 换回该站的内置基线，再自动用新 key 刷新（中国站独有 `deepseek-*` / `glm-*`，
-   国际站是 5 个 `sensenova-*` 模型，含 2 个生图模型，全部列出）；
-3. **限流额度** —— 两个站的 RPM 分开算（本地预限流默认中国站 2、国际站 3）；
-4. **key 健康状态** —— 冷却/失效是针对旧站记下的，切过去时一律清掉，不带着旧标记进新站。
+- **Key 池独立**：Key 只加入当前管理站；删除、清空、探活均不影响另一站。
+- **模型目录、隐藏模型与窗口独立**：包括同名模型，各站分别刷新目录、保存可见性及上下文窗口 / 最大输出覆盖。
+- **外部接口与密钥独立**：各站有自己的本地接口地址和 API Key，外部客户端须成对使用对应站的地址与密钥。
+- **冷却、失效与 RPM 状态独立**：Tab 切换不重置健康状态；默认每把 Key 的本地 RPM 中国站为 2、国际站为 3。
 
-> ⚠️ 两个站的 key **互不通用**：拿国际站的 key 打中国站会得到 `401 Forbidden`。插件不会
-> 自动猜你在哪个站（猜错会把本来好用的 key 标成失效），所以端点必须自己选对 ——
-> 如果切过去后所有 key 都显示「已失效」，先检查是不是选错了站。
+> ⚠️ 两站 Key **互不通用**，请分别在对应 Tab 添加。国际站 Key 发到中国站（反之亦然）可能返回 401 / 403；Tab 不会替你把已有 Key 移到另一站。
+
+#### 从旧版升级
+
+旧共享凭据只迁移到**旧 `endpoint` 所属站**（旧记录没有该字段时按旧配置 `endpoint` 判断，缺省中国站），另一站 Key 池和自定义模型设置为空（模型目录从该站内置基线开始），不会复制旧 Key。原有隐藏模型、窗口覆盖和外部密钥也只由所属站继承。迁移后两站分别保存独立凭据；**保留旧记录供回退**，不删除或覆盖它。
+
+旧版国际站会话仍可能保存 `sensenova-pool`，该 provider 现在固定指向中国站。**继续旧国际站会话前，必须重新选择「商汤日日新 · 国际站」（`sensenova-pool-intl`）及对应模型**；仅切设置 Tab 不会修改会话 provider。
 
 ### 🧠 一次接入全部模型
 
-装好插件后，模型选择器里自动出现「商汤日日新（Key 轮换池）」分组，包含以下模型：
+装好插件后，模型选择器里分别出现「商汤日日新 · 中国站」和「商汤日日新 · 国际站」分组。中国站内置以下模型；国际站目录见下文常见问题：
 
 | 模型 | 上下文 | 最大输出 | 图片输入 |
 |---|---|---|---|
@@ -107,7 +111,7 @@ Key 存在 DSH 的凭据库里，不写进任何配置文件。填入即生效�
 
 ### 🔌 提供对外的 OpenAI 兼容接口
 
-插件在 127.0.0.1 上起一个 OpenAI 兼容服务。设置页显示接口地址和 API Key，复制后填进其他 Agent 或客户端即可使用；请求共用同一个 Key 池，遇到限流同样自动换 Key。
+插件为两站分别在 127.0.0.1 上提供独立 OpenAI 兼容服务。当前 Tab 显示该站接口地址和 API Key，复制后填进其他 Agent 或客户端即可使用；请求只共用该站的 Key 池，遇到限流同样自动换 Key。以下地址仅为中国站示例，请以各 Tab 实际显示为准。
 
 ```bash
 curl http://127.0.0.1:51234/v1/chat/completions \
@@ -179,9 +183,9 @@ pnpm --dir "$DSH_PROFILE_DIR" add "link:$PWD"
 
 ## 使用
 
-### 1. 填入 Key
+### 1. 选择管理站并填入 Key
 
-打开 **设置 → dsh-sensenova-pool**（或插件页里本插件的卡片），在弹出的卡片里粘贴一把或多把商汤 Key：
+打开 **设置 → dsh-sensenova-pool**（或插件页里本插件的卡片），先选中国站或国际站 Tab，再粘贴该站申请的一把或多把商汤 Key：
 
 ```
 sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -191,14 +195,13 @@ sk-cccccccccccccccccccccccccccccc
 
 点「**添加 Key**」。支持多种分隔方式，重复和无效项会被自动过滤。
 
-### 2. 先确认端点
+### 2. 确认管理视图与上游地址
 
-卡片最上方的「上游端点」区显示当前打的是哪个站 —— 中国站还是国际站。点另一个按钮即可切换，
-下方会显示切换后的实际上游地址。**key 只在自己申请的那个站有效**，选错站会看到 401。
+当前 Tab 显示该站的实际上游地址。Tab 只决定你正在管理哪一站；两站仍同时工作。**Key 只在自己申请的那个站有效**，请不要将它加入另一站。
 
 ### 3. 选择模型
 
-新建会话，在模型选择器里选「**商汤日日新（Key 轮换池）**」下的任意模型，然后正常对话即可。
+新建会话，在模型选择器里选「**商汤日日新 · 中国站**」或「**商汤日日新 · 国际站**」下的对应模型，然后正常对话即可。会话 provider 决定请求所属站，与设置页当前 Tab 无关。旧国际站会话须重新选择国际站 provider。
 
 ### 4. 需要时调整
 
@@ -213,7 +216,7 @@ sk-cccccccccccccccccccccccccccccc
 
 ### 5. 接入其他服务
 
-设置页「本地接口」区给出两样东西：
+设置页当前站的「本地接口」区给出两样东西；另一站有独立地址和密钥，不可混用：
 
 | 字段 | 示例 | 说明 |
 |---|---|---|
@@ -244,33 +247,28 @@ print(client.chat.completions.create(
 - id: llm-sensenova-pool
   name: dsh-sensenova-pool
   config:
-    endpoint: cn         # cn = 中国站，intl = 国际站；默认 cn。也可在设置卡片里切换
+    endpoint: cn         # 旧配置兼容：旧记录归属及自定义 baseUrl 所属站；不再切换运行实例
     rpmLimit: 2          # 每把 Key 的本地 RPM 预限流上限；0 = 关闭，-1（默认）= 按端点取值
     maxAttempts: 6       # 单个请求最多尝试几把 Key
     maxConcurrency: 1    # 每把 Key 的并发上限；1 = 串行（推荐）
     acquireTimeoutMs: 180000
     requestTimeoutMs: 60000
-    # baseUrl: https://token.sensenova.cn/v1   # 仅当所有请求要走自建网关时才填；填了就不随端点切换
+    # baseUrl: https://token.sensenova.cn/v1   # 仅覆盖 endpoint 指定的站；另一站仍用官方地址
 ```
 
-`endpoint` 只决定**默认**端点：一旦在设置卡片里切过，以卡片里的选择（存在凭据库）为准，
-这样「重启后还记得你在哪个站」不需要改配置文件。`rpmLimit` 留默认值时按端点取
-（中国站 2、国际站 3），显式写数字则两个端点都用这个值。
+`endpoint` 保留用于旧凭据归属兼容（旧记录自身的 `endpoint` 字段优先）以及指定自定义 `baseUrl` 所属站，**不控制两站启停或 Tab**。两站始终各自使用固定上游；`baseUrl` 只覆盖配置 `endpoint` 所属站，另一站仍走官方地址，避免错误复用地址而泄漏 Key。`rpmLimit` 留默认值时按站取值（中国站 2、国际站 3），显式写数字则两站使用同一上限数值，但各自的计数与冷却独立。
 
 `rpmLimit` 的中国站默认值 2 基于实测（真实上限约 3 RPM）。**调大它不会提高吞吐，只会更容易被限流** —— 想提高吞吐应该增加 Key，而不是加压。
 
-**两个站的 Key 能混着用吗？** 不能。key 只在发卡的那个站有效，池子只打「当前选中的端点」，
-所以换站后要换用该站的 key（切站不会删除现有的 key，切回来它们还在）。
+**两个站的 Key 能混着用吗？** 不能。Key 只在发卡站有效。请在各站 Tab 分别添加；切换 Tab 不搬移、不删除 Key，也不改变另一站的请求。
 
 ---
 
 ## 常见问题
 
-**切到国际站后所有 key 都显示「已失效」？**
+**国际站 Key 显示「已失效」？**
 
-基本就是**选错站了**：国际站的 key 打中国站会返回 `401 Forbidden`，反之亦然。切回正确的站即可
-（切站时会清掉冷却/失效标记，所以切回来那些 key 会立刻恢复可用）。如果确认站选对了仍然 401，
-那才是 key 本身的问题。
+先确认 Key 是否在国际站申请、是否添加到了国际站 Tab。两站 Key 互不通用；Tab 切换不会清除失效或冷却标记。若误加到另一站，请移除后在正确站添加；归属正确仍返回 401 / 403 时，再检查 Key 或套餐权限。
 
 **国际站里怎么没有 `deepseek-v4-flash` / `glm-5.2`？**
 
@@ -456,7 +454,7 @@ Paste one or more SenseNova API keys in one place and use every SenseNova model 
 - **Never leaks a 429 upward** — when every key is exhausted the plugin reports `503 + Retry-After` so DSH backs off on its own
 - **All models, zero config** — a built-in catalogue works offline and refreshes from `/v1/models` once a valid key is present, so new models need no plugin upgrade
 - **Keys are masked** — only `sk-example...0001` style masks are ever displayed
-- **Two endpoints** — pick the China site (`token.sensenova.cn`) or the international site (`token.sensenova.ai`) from the settings card; switching also swaps the model list and the rate-limit budget, and the choice survives restarts
+- **双站隔离（未发布）** — 中国站 / 国际站 Tab 只切管理视图，两站同时工作；provider 分别为 `sensenova-pool` / `sensenova-pool-intl`，显示「商汤日日新 · 中国站 / 国际站」。各站 Key 池、模型目录、隐藏模型、窗口覆盖、本地接口 / 密钥与冷却 / RPM 状态完全独立。旧凭据仅迁移到旧 `endpoint` 所属站，另一站为空，旧记录保留回退；旧国际站会话须重新选择国际站 provider。
 
 ### Install
 

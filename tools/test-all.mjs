@@ -27,6 +27,7 @@ const SUITES = [
   { name: '推理档位按模型映射（issue #3）', file: 'test-reasoning-efforts.mjs', args: [] },
   { name: '端点（中国站 / 国际站）', file: 'test-endpoints.mjs', args: [] },
   { name: 'apply() 启动时序', file: 'test-apply.mjs', args: ['--import', './tools/stub-loader.mjs'] },
+  { name: '双站实例隔离与旧记录迁移', file: 'test-site-isolation.mjs', args: ['--import', './tools/stub-loader.mjs'] },
   { name: '凭据记录 schema', file: 'test-credentials-record.mjs', args: ['--import', './tools/stub-loader.mjs'] },
   { name: '启动期凭据竞态（issue #1）', file: 'test-credentials-race.mjs', args: ['--import', './tools/stub-loader.mjs'] },
   { name: 'Web 路由与令牌', file: 'test-routes.mjs', args: [] },

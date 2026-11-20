@@ -3,6 +3,22 @@
 本文件记录本插件的所有重要变更，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.0] - 2026-11-20
+
+### 修复
+
+- **中国站 / 国际站双站隔离**：设置页 Tab 只切换管理视图，不再修改共享实例上游。两站同时工作，可同时进行对话和处理外部请求。
+- 分别注册 `sensenova-pool`（商汤日日新 · 中国站）与 `sensenova-pool-intl`（商汤日日新 · 国际站），会话 provider 决定请求归属，不受当前 Tab 影响。
+- 两站分别维护 Key 池、模型目录、隐藏模型、上下文窗口 / 最大输出覆盖、本地外部接口及其 API Key、冷却 / 失效 / RPM 状态；切换 Tab 不重置或串用另一站状态。
+- 旧配置中的自定义 `baseUrl` 只作用于配置 `endpoint` 所属站，另一站仍使用自己的官方地址，避免向错误上游发送 Key。
+
+### 迁移与兼容性
+
+- 旧共享凭据仅迁移到旧记录 `endpoint` 所属站；旧记录缺少该字段时按旧配置 `endpoint` 判断，缺省中国站。旧 Key、隐藏模型、窗口设置和外部密钥不复制到另一站，另一站从空 Key 池和默认模型设置开始。
+- 两站迁移后使用各自独立凭据记录；保留旧记录供回退，不删除或覆盖旧记录。
+- **旧国际站会话必须重新选择国际站 provider**（`sensenova-pool-intl`）及对应模型：旧 `sensenova-pool` 现在固定属于中国站，切换设置 Tab 不会修改会话 provider。
+- 修复 [#6](https://github.com/Phoeky/dsh-sensenova-pool/issues/6) 反馈的跨站模型选择混乱，感谢 @zuosus 提供反馈。
+
 ## [1.1.0] - 2026-11-19
 
 ### 新增

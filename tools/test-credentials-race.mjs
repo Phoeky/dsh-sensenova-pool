@@ -1,3 +1,5 @@
+const realFetch = globalThis.fetch;
+globalThis.fetch = (input, init) => String(input).startsWith('http://127.0.0.1') ? realFetch(input, init) : Promise.resolve(new Response(JSON.stringify({ data: [] }), { headers: { 'content-type': 'application/json' } }));
 /**
  * 回归测试：issue #1 —— 启动期凭据竞态导致「重启电脑后 Key 池为空」。
  *
@@ -27,7 +29,7 @@ const check = (n, c, d = '') => {
 
 globalThis.__capture = { adapters: [], providers: [] };
 
-const RECORD_ID = 'dsh-sensenova-pool/keys';
+const RECORD_ID = 'dsh-sensenova-pool/keys-cn';
 const STORED_KEYS = ['sk-racekey0000000001', 'sk-racekey0000000002'];
 
 /**
@@ -126,6 +128,7 @@ function makeCtx({ withCredentials = true } = {}) {
   /** 模拟 credentials-local 的 loadInitial() 完成。 */
   state.becomeReady = (keys = STORED_KEYS) => {
     state.records.set(RECORD_ID, { kind: 'grant', payload: { keys } });
+    state.records.set('dsh-sensenova-pool/keys-intl', { kind: 'grant', payload: { keys: ['sk-international-race0001'] } });
     state.ready = true;
     firePendingInject();
   };
@@ -150,7 +153,7 @@ console.log('\n[race] 凭据服务先注册、后就绪：就绪后必须补载 
   state.becomeReady();
   await new Promise((r) => setTimeout(r, 200));
 
-  const loaded = state.logs.info.find((m) => m.includes('已装载'));
+  const loaded = state.logs.info.find((m) => m.includes('已装载 2 把'));
   check('服务就绪后自动补载 key（核心回归点）', typeof loaded === 'string', JSON.stringify(state.logs.info));
   check('装载了 2 把 key', typeof loaded === 'string' && loaded.includes('2'), loaded);
   check('没有错误日志', state.logs.error.length === 0, JSON.stringify(state.logs.error));
@@ -167,7 +170,7 @@ console.log('\n[race] 凭据服务已就绪时（热重启）：立即装载');
   apply(ctx, {});
   await new Promise((r) => setTimeout(r, 300));
 
-  const loaded = state.logs.info.find((m) => m.includes('已装载'));
+  const loaded = state.logs.info.find((m) => m.includes('已装载 2 把'));
   check('就绪状态下启动即装载 2 把 key', typeof loaded === 'string' && loaded.includes('2'), JSON.stringify(state.logs.info));
   for (const d of state.effects) await d?.();
 }
@@ -243,6 +246,7 @@ console.log('\n[race] 首次装载完成前写入：不得用空池覆盖掉已�
   check('原有 2 把 key 未被空池覆盖', stored.includes(STORED_KEYS[0]) && stored.includes(STORED_KEYS[1]), JSON.stringify(stored));
   check('新加的 key 已落盘', stored.includes('sk-racekey0000000003'), JSON.stringify(stored));
   check('记录共 3 把 key', stored.length === 3, JSON.stringify(stored));
+  check('国际站快照未被并发写入污染', JSON.stringify(state.records.get('dsh-sensenova-pool/keys-intl')?.payload?.keys) === JSON.stringify(['sk-international-race0001']));
 
   server.closeAllConnections();
   await new Promise((r) => server.close(r));

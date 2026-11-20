@@ -82,6 +82,8 @@ export interface RouteDeps {
   status: StatusProvider;
   pool: KeyPool;
   logger: Logger;
+  /** 首次装载完成前不修改池子，避免把磁盘旧 Key 覆盖掉。 */
+  prepareWrite?(): Promise<void>;
   /** key 列表发生变更后回调（持久化 + 刷新目录）。 */
   onKeysChanged(): Promise<void>;
   /** 模型可见性发生变更后回调（收到完整的「被隐藏」列表）。 */
@@ -213,7 +215,7 @@ export function parseKeyInput(input: unknown): string[] {
 // ------------------------------------------------------------------ 路由
 
 /** 在可选的 webServer 服务上挂载 key 管理路由。 */
-export function registerKeyRoutes(ctx: any, deps: RouteDeps): void {
+export function registerKeyRoutes(ctx: any, deps: RouteDeps, routeBase = ROUTE_BASE): void {
   /**
    * 每进程随机的写入令牌。
    *
@@ -257,7 +259,7 @@ export function registerKeyRoutes(ctx: any, deps: RouteDeps): void {
     };
 
     // ---- 状态：池健康度、目录来源、最近轮换 ----------------------------
-    register(`${ROUTE_BASE}/status`, async (req, res) => {
+    register(`${routeBase}/status`, async (req, res) => {
       if (req.method !== 'GET') {
         sendJson(res, 405, { error: 'method not allowed' });
         return;
@@ -281,7 +283,7 @@ export function registerKeyRoutes(ctx: any, deps: RouteDeps): void {
     }, 'status route');
 
     // ---- 列出 key（永远脱敏） ------------------------------------------
-    register(`${ROUTE_BASE}/keys`, async (req, res) => {
+    register(`${routeBase}/keys`, async (req, res) => {
       if (req.method === 'GET') {
         sendJson(res, 200, { keys: deps.status.pool() });
         return;
@@ -290,6 +292,7 @@ export function registerKeyRoutes(ctx: any, deps: RouteDeps): void {
       if (req.method === 'POST') {
         if (!requireAdmin(req, res)) return;
         const body = await readJsonBody(req);
+        await deps.prepareWrite?.();
         const action = typeof body?.action === 'string' ? body.action : 'add';
 
         if (action === 'add') {
@@ -455,7 +458,7 @@ export function registerKeyRoutes(ctx: any, deps: RouteDeps): void {
     }, 'keys route');
 
     // ---- 单把 key 探活：真实打一次极小请求，立刻告诉用户好不好使 --------
-    register(`${ROUTE_BASE}/test`, async (req, res) => {
+    register(`${routeBase}/test`, async (req, res) => {
       if (req.method !== 'POST') {
         sendJson(res, 405, { error: 'method not allowed' });
         return;

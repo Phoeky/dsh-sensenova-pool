@@ -101,6 +101,17 @@ console.log('\n[endpoints] 目录缓存可随端点重置');
   check('reset 回中国站 → 恢复中国站基线', catalog.current().some((m) => m.id === 'deepseek-v4-flash'));
 }
 
+console.log('\n[endpoints] 两站目录实例互不影响');
+{
+  const cn = new ModelCatalog();
+  const intl = new ModelCatalog();
+  intl.reset('intl');
+  cn.apply({ data: [{ id: 'cn-only-live', context_length: 65536 }] }, BUILTIN_MODELS);
+  check('刷新中国目录不污染国际基线', intl.status().source === 'builtin' && !intl.current().some((m) => m.id === 'cn-only-live'));
+  intl.apply({ data: [{ id: 'intl-only-live', context_length: 32768 }] }, INTL_BUILTIN_MODELS);
+  check('刷新国际目录不覆盖中国 live 目录', cn.current().length === 1 && cn.current()[0].id === 'cn-only-live' && cn.current()[0].contextWindow === 65536);
+}
+
 console.log('\n[endpoints] key 池：额度可运行时调整');
 {
   const pool = new KeyPool(['sk-a', 'sk-b'], { rpmLimit: 2, maxConcurrency: 1 });

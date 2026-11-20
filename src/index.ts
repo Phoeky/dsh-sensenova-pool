@@ -114,14 +114,14 @@ export const Config = z.object({
     .default(DEFAULT_ENDPOINT_ID)
     .description(
       '上游端点：cn = 中国站（token.sensenova.cn），intl = 国际站（token.sensenova.ai）。' +
-        '两个站的 key 互不通用；也可以在设置卡片里切换，切换结果会持久化。' +
+        '两站同时运行；该字段仅用于旧记录迁移和旧自定义地址归属。' +
         '写错的值不会被拒绝，而是回落到 cn（不让一个拼写问题把插件卡在加载阶段）。',
     ),
   baseUrl: z
     .string()
     .default('')
     .description(
-      '覆盖端点地址（填空表示用所选端点的默认地址）。仅在所有请求要走自建网关 / 代理时使用。',
+      '覆盖 endpoint 指定站点的地址（留空使用官方地址）；另一站保持官方地址，避免跨站发送 Key。',
     ),
   maxAttempts: z.number().default(6).description('单个请求最多尝试几把 key'),
   acquireTimeoutMs: z.number().default(180_000).description('等待可用 key 的总预算（毫秒）'),
@@ -177,14 +177,16 @@ const INERT_AUTH = {
   },
 };
 
+/** 两站各自创建完整运行实例；Tab 不参与请求路由。 */
 export function apply(ctx: any, config: PluginConfig): void {
-  /**
-   * 配置文件里的端点（缺省 = 中国站，保证老用户升级后行为不变）。
-   *
-   * 运行期真正生效的端点是 `currentEndpoint`：它以凭据记录里的选择为准（用户在
-   * 设置卡片里切过），没有记录时回落到这里。
-   */
-  const configEndpoint = endpointFor(config?.endpoint);
+  for (const site of ['cn', 'intl'] as const) applySite(ctx, config, site);
+}
+
+function applySite(ctx: any, config: PluginConfig, site: EndpointId): void {
+  const PROVIDER_ID = site === 'cn' ? 'sensenova-pool' : 'sensenova-pool-intl';
+  const PROVIDER_NAME = site === 'cn' ? '商汤日日新 · 中国站' : '商汤日日新 · 国际站';
+  // 每站实例有固定身份；旧 config.endpoint 只用于迁移归属。
+  const configEndpoint = endpointFor(site);
   /**
    * config 里显式写的 `rpmLimit`（≥0 才算显式）；-1（默认）表示「按端点取默认值」。
    */
@@ -205,19 +207,18 @@ export function apply(ctx: any, config: PluginConfig): void {
     error: (message: string) => ctx.logger?.error?.(`sensenova-pool: ${message}`),
   };
 
-  /** 当前生效的端点。启动时取 config，装载凭据记录后可能被记录里的选择覆盖。 */
-  let currentEndpoint: SenseNovaEndpoint = configEndpoint;
+  /** 本实例的固定站点，凭据重载或 Tab 操作均不改变它。 */
+  const currentEndpoint: SenseNovaEndpoint = configEndpoint;
 
   /**
-   * 用户显式指定了 `baseUrl` 时不随端点切换（自建网关 / 代理的场景）。
-   *
-   * 这时「端点」只影响**内置基线与显示**，请求一律走用户给的地址。
+   * 兼容旧自定义网关：仅 config.endpoint 对应站点使用自定义地址，另一站使用官方地址。
    */
   const baseUrlPinned = resolved.baseUrl.length > 0;
 
   /** 所选端点对应的上游根地址。 */
   function upstreamFor(endpoint: SenseNovaEndpoint): string {
-    return baseUrlPinned ? resolved.baseUrl : endpoint.baseUrl;
+    // 旧版自定义地址只用于其配置所属站，禁止另一站也复用它而泄漏 Key。
+    return baseUrlPinned && site === endpointFor(config?.endpoint).id ? resolved.baseUrl : endpoint.baseUrl;
   }
 
   /** 该端点下每把 key 的本地 RPM 上限（0 表示不限流）。 */
@@ -226,7 +227,7 @@ export function apply(ctx: any, config: PluginConfig): void {
   }
 
   const catalog = new ModelCatalog();
-  // 回环服务按**端点**而不是地址区分：即使 baseUrl 被固定，切换端点也要换目录基线。
+  // 每个实例只装载本站基线；自定义网关不改变站点身份。
   catalog.reset(currentEndpoint.id);
   const pool = new KeyPool([], {
     rpmLimit: (() => {
@@ -280,6 +281,7 @@ export function apply(ctx: any, config: PluginConfig): void {
 
   /** 凭据库里是否**已有**本插件的记录（决定首次装载后要不要立刻补写）。 */
   let recordExisted = false;
+  let migrationPending = false;
 
   /** 最近的轮换事件，供状态页展示「刚才发生了什么」。 */
   const recentRotations: Array<{ keyId: string; kind: string; status: number; message: string; at: number }> = [];
@@ -317,8 +319,8 @@ export function apply(ctx: any, config: PluginConfig): void {
     upstreamEndpoint: (): EndpointStatus => ({
       current: currentEndpoint.id,
       upstream: shim.upstream(),
-      /** baseUrl 被 config 固定时，界面要提示「切端点只换目录/额度，不改地址」。 */
-      pinned: baseUrlPinned,
+      // 是否为本站配置了自定义上游。
+      pinned: baseUrlPinned && site === endpointFor(config?.endpoint).id,
       rpmLimit: rpmLimitFor(currentEndpoint),
       options: ENDPOINTS.map((option) => ({
         id: option.id,
@@ -362,7 +364,8 @@ export function apply(ctx: any, config: PluginConfig): void {
    * 一套持久化路径不值得。grant 的 payload 是**逐字保留**的，多几个字段完全安全。
    */
   const RECORD_SCOPE = 'dsh-sensenova-pool';
-  const RECORD_ID = `${RECORD_SCOPE}/keys`;
+  const RECORD_ID = `${RECORD_SCOPE}/keys-${site}`;
+  const LEGACY_RECORD_ID = `${RECORD_SCOPE}/keys`;
 
   /** 凭据记录里我们自己的 payload 形状（全部字段可选，便于向前兼容）。 */
   interface PoolPayload {
@@ -429,6 +432,7 @@ export function apply(ctx: any, config: PluginConfig): void {
    * 权威装载之前写入（启动还没完，用户就点了「添加 Key」），池子里只有刚加的那把，
    * 磁盘上原有的 key 会被静默抹掉。
    */
+  let authoritativeLoaded = false;
   let notifyKeysLoaded: (() => void) | undefined;
   const firstAuthoritativeLoad = new Promise<void>((resolve) => {
     notifyKeysLoaded = resolve;
@@ -458,28 +462,20 @@ export function apply(ctx: any, config: PluginConfig): void {
           }
         }
       }
+      if (migrationPending) {
+        // 先清标记，避免 modifyRecord 的变更事件重入时重复迁移。
+        migrationPending = false;
+        try {
+          await persistRecord();
+        } catch (error) {
+          migrationPending = true;
+          logger.warn('旧版状态迁移暂未落盘，保留旧记录以便下次重试');
+        }
+      }
+      authoritativeLoaded = true;
       notifyKeysLoaded?.();
     }
     return added;
-  }
-
-  /**
-   * 应用一个"未来可能换端点"的选择（启动装载时用）。
-   *
-   * 与运行期的 {@link applyEndpoint} 同源，但这里不落盘、不刷新目录 —— 调用方
-   * （启动装载）随后会自己触发目录刷新，重复调用只会白白多打一次上游。
-   */
-  function adoptEndpoint(id: EndpointId): boolean {
-    if (id === currentEndpoint.id) return false;
-    currentEndpoint = endpointFor(id);
-    catalog.reset(currentEndpoint.id);
-    shim.setUpstream(upstreamFor(currentEndpoint));
-    pool.setRpmLimit((() => {
-      const limit = rpmLimitFor(currentEndpoint);
-      return limit > 0 ? limit : null;
-    })());
-    pool.resetHealth();
-    return true;
   }
 
   /** 生成一把形如商汤 key 的对外密钥（只被本地 shim 校验，不发给上游）。 */
@@ -496,13 +492,26 @@ export function apply(ctx: any, config: PluginConfig): void {
     let record: { kind?: string; payload?: PoolPayload } | undefined;
     try {
       record = await credentials.readRecord(RECORD_ID);
+      if (record === undefined || record === null) {
+        // 旧共享记录仅由原选中站继承；另一站不得复制旧 Key。
+        // 保留旧记录，便于回退。独立记录存在后不再重复迁移。
+        const legacy = await credentials.readRecord(LEGACY_RECORD_ID);
+        const legacySite = endpointFor(legacy?.payload?.endpoint ?? config?.endpoint).id;
+        if (legacy && legacySite === site) {
+          record = legacy;
+          migrationPending = true;
+        }
+      }
     } catch (error) {
-      logger.warn(`读取 key 记录失败：${error instanceof Error ? error.message : String(error)}`);
-      return 0;
+      throw new Error(`读取 key 记录失败：${error instanceof Error ? error.message : String(error)}`);
     }
     const payload = record?.payload ?? {};
     recordExisted = record !== undefined && record !== null;
     const keys = Array.isArray(payload.keys) ? payload.keys : [];
+    const authoritativeKeys = new Set(keys.filter((key): key is string => typeof key === 'string').map((key) => key.trim()));
+    for (const existing of pool.keys()) {
+      if (!authoritativeKeys.has(existing)) pool.removeKey(existing);
+    }
     let added = 0;
     for (const raw of keys) {
       if (typeof raw === 'string' && pool.addKey(raw)) added += 1;
@@ -536,9 +545,7 @@ export function apply(ctx: any, config: PluginConfig): void {
       shim.setToken(externalKey);
     }
 
-    // 端点：记录里的选择优先于 config（用户在设置卡片里切过之后，重启也必须记住）。
-    // 记录里没有该字段 = 从未切过，保持 config 的端点，老用户行为不变。
-    if (isEndpointId(payload.endpoint)) adoptEndpoint(payload.endpoint);
+    // 本实例的站点固定，不采纳记录里的切站请求。
 
     if (added > 0) logger.info(`已装载 ${added} 把 key`);
     return added;
@@ -799,10 +806,8 @@ export function apply(ctx: any, config: PluginConfig): void {
       if (key !== RECORD_ID) return;
       void loadKeysAndNotify()
         .then((added) => {
-          if (added > 0) {
-            refreshCatalog();
-            void fetchCatalogFromUpstream();
-          }
+          refreshCatalog();
+          if (added > 0) void fetchCatalogFromUpstream();
         })
         .catch((error: unknown) => {
           logger.warn(`记录变更后重载失败：${error instanceof Error ? error.message : String(error)}`);
@@ -819,7 +824,7 @@ export function apply(ctx: any, config: PluginConfig): void {
    */
   async function fetchCatalogFromUpstream(): Promise<void> {
     if (pool.size === 0) return;
-    // 现取上游地址与基线：两次请求之间用户可能已经切换了端点。
+    // 目录和上游固定属于本站，另一站的刷新不会覆盖本实例。
     const endpoint = currentEndpoint;
     const url = `${shim.upstream().replace(/\/+$/, '')}/models`;
     const attempted = new Set<string>();
@@ -838,8 +843,6 @@ export function apply(ctx: any, config: PluginConfig): void {
         });
         if (response.ok) {
           const payload = await response.json();
-          // 请求在途时端点被切走：这份响应对新端点没有意义，丢弃。
-          if (currentEndpoint.id !== endpoint.id) return;
           const count = catalog.apply(payload, builtinModelsFor(endpoint.id));
           pool.reportSuccess(entry);
           if (count > 0) {
@@ -920,42 +923,14 @@ export function apply(ctx: any, config: PluginConfig): void {
     }
   };
 
-  /**
-   * 切换上游端点（中国站 ⇄ 国际站）。
-   *
-   * 这是「换一个站继续用」而不是「改个地址」：两个站的 key、模型、限流额度都
-   * 不同，所以四件事必须一起做，缺一件都会让状态变得自相矛盾：
-   *
-   *   1. **上游地址** —— 之后所有请求打到新站；
-   *   2. **模型目录** —— 退回新站的内置基线（旧站的模型列表在新站上多数是 404）；
-   *   3. **RPM 额度** —— 新站有自己的额度（中国站实测约 3 RPM，国际站另计）；
-   *   4. **key 健康状态** —— 冷却/失效是针对旧站记下的，带过去会让切站后几分钟
-   *      内一把 key 都用不了。
-   *
-   * 落盘顺序：先写凭据记录再刷新模型选择器 —— 刷新会让 DSH 立刻重读模型，
-   * 若此时记录还没写成功，用户会看到「切换了但重启又回到原来那个站」。
-   * 落盘失败不回滚：内存里已经切过去了，会话可用性优先，下次写入会一并带上。
-   */
+  /** 保留旧接口但禁止修改固定站点的上游，避免旧客户端串站。 */
   const handleEndpointChanged = async (id: string): Promise<void> => {
-    if (!isEndpointId(id)) throw new Error(`未知端点：${id}`);
-    if (id === currentEndpoint.id) return;
-
-    adoptEndpoint(id);
-    logger.info(`已切换上游端点到「${currentEndpoint.label}」（${shim.upstream()}）`);
-
-    try {
-      await saveKeys();
-    } catch (error) {
-      logger.warn(`端点选择落盘失败（本次会话已生效）：${error instanceof Error ? error.message : String(error)}`);
-    }
-
-    refreshCatalog();
-    void fetchCatalogFromUpstream();
+    if (id !== site) throw new Error('站点已隔离，请在设置页切换 Tab，不支持切换实例上游');
   };
 
   // 设置页：填 key（用户明确要求只在设置页填）。
   try {
-    registerSettingsSection(ctx, {
+    if (site === 'cn') registerSettingsSection(ctx, {
       namespace: SETTINGS_NS,
       config,
       pool,
@@ -975,6 +950,12 @@ export function apply(ctx: any, config: PluginConfig): void {
       onModelsChanged: handleModelsChanged,
       onModelLimitsChanged: handleModelLimitsChanged,
       onEndpointChanged: handleEndpointChanged,
+      prepareWrite: async () => {
+        if (credentialsRegistered()) {
+          await Promise.race([firstAuthoritativeLoad, delay(SAVE_LOAD_WAIT_MS)]);
+          if (!authoritativeLoaded) throw new Error('凭据尚未成功装载，请稍后重试或检查凭据服务');
+        }
+      },
       reload: async () => {
         // 手动重载：走同一套「装载并宣告」逻辑，因此在启动早期点它也不会把
         // 「还没读到」误当成「真的没有 key」而清空权威装载信号。
@@ -982,7 +963,7 @@ export function apply(ctx: any, config: PluginConfig): void {
         refreshCatalog();
       },
       fetchCatalog: fetchCatalogFromUpstream,
-    });
+    }, site === 'cn' ? undefined : '/plugins/dsh-sensenova-pool/intl');
   } catch (error) {
     logger.warn(`Web 路由注册失败：${error instanceof Error ? error.message : String(error)}`);
   }

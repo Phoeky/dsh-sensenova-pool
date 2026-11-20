@@ -29,7 +29,7 @@ const ALLOWED_FIELDS = {
   grant: ['kind', 'payload'],
 };
 
-const RECORD_ID = 'dsh-sensenova-pool/keys';
+const RECORD_ID = 'dsh-sensenova-pool/keys-cn';
 
 let pass = 0, fail = 0;
 const check = (n, c, d = '') => { c ? (pass++, console.log(`  PASS  ${n}`)) : (fail++, console.log(`  FAIL  ${n}${d ? ' — ' + d : ''}`)); };
@@ -102,17 +102,7 @@ state.services.webServer = {
 
 // ---- 真实调用 apply() ------------------------------------------------------
 
-/**
- * 拦住对外网的 fetch，但放行回环（测试自己要用 127.0.0.1 起 HTTP 服务）。
- *
- * 为什么必须拦：填完 key 后 `onKeysChanged` 会 `void fetchCatalogFromUpstream()`，
- * 对真实的 `https://token.sensenova.cn/v1/models` 发一次请求。测试不该依赖网络，
- * 而且进程在这条请求还停在 DNS/TLS 阶段就 `process.exit()` 时，Windows 上会撞上
- * libuv 断言：
- *   Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), src\win\async.c, line 94
- * 表现为退出码 0xC0000409 —— 断言全过，套件却被判失败。这里让上游不可达，插件走
- * 「目录刷新失败但不影响可用性」的分支，正是我们要的确定性行为。
- */
+// 拦住真实外网并返回空目录，保留基线；回环请求走真实 HTTP。
 const realFetch = globalThis.fetch;
 globalThis.fetch = async (input, init) => {
   const url = typeof input === 'string' ? input : input?.url ?? String(input);
@@ -120,7 +110,7 @@ globalThis.fetch = async (input, init) => {
   if (hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1') {
     return realFetch(input, init);
   }
-  throw new Error(`offline: outbound fetch to ${hostname} is stubbed in this test`);
+  return Response.json({ data: [] });
 };
 
 const { apply } = await import('../lib/index.js');
@@ -176,7 +166,7 @@ check('落盘过程没有 warn 日志', !warnings.some((m) => m.includes('keys r
 
 // ---- 模型可见性：隐藏一个模型后，provider 的模型列表里必须真的没有它 ---------
 {
-  const adapter = globalThis.__capture.adapters.at(-1);
+  const adapter = globalThis.__capture.adapters.find((adapter) => adapter.profiles().has('sensenova-pool'));
   const modelsOf = () => {
     const profile = adapter.profiles().get('sensenova-pool');
     return profile.piProvider.getModels().map((m) => m.id);
@@ -203,34 +193,19 @@ check('落盘过程没有 warn 日志', !warnings.some((m) => m.includes('keys r
   check('落盘带对外密钥', typeof last?.payload?.externalKey === 'string' && last.payload.externalKey.startsWith('sk-dsh-'), String(last?.payload?.externalKey));
 }
 
-// ---- 端点：切换后必须落盘（重启后仍记得选的是哪个站） ----------------------
+// ---- 固定站点拒绝旧切换动作，不写错站记录 -------------------------------
 {
   const before = written.length;
-  const switchRes = await fetch(`${origin}/plugins/dsh-sensenova-pool/keys`, {
+  const response = await fetch(`${origin}/plugins/dsh-sensenova-pool/keys`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-sensenova-pool-admin': adminKey },
     body: JSON.stringify({ action: 'set-endpoint', id: 'intl' }),
   });
-  check('POST set-endpoint → 200', switchRes.status === 200, `status=${switchRes.status}`);
-  const switchBody = await switchRes.json();
-  check('切换到国际站', switchBody.upstreamEndpoint?.current === 'intl', JSON.stringify(switchBody.upstreamEndpoint));
-  check('上游地址换成 token.sensenova.ai', switchBody.upstreamEndpoint?.upstream === 'https://token.sensenova.ai/v1', String(switchBody.upstreamEndpoint?.upstream));
-  check('切换触发了一次落盘', written.length === before + 1, `${before} → ${written.length}`);
-  check('切换后记录仍通过 schema 校验', validationError === '', validationError);
-  const last = written.at(-1)?.record;
-  check('payload.endpoint 写入 intl', last?.payload?.endpoint === 'intl', JSON.stringify(last?.payload?.endpoint));
-  check('切换不丢 key', Array.isArray(last?.payload?.keys) && last.payload.keys.length === 2, JSON.stringify(last?.payload?.keys));
-
-  // 模型目录也必须整批换成国际站的（不能还挂着中国站的 deepseek / glm）。
-  const adapter = globalThis.__capture.adapters.at(-1);
-  const intlModels = adapter.profiles().get('sensenova-pool').piProvider.getModels().map((m) => m.id);
-  check('切换后注册的是国际站模型', intlModels.length > 0 && intlModels.every((id) => id.startsWith('sensenova-')),
-    JSON.stringify(intlModels));
-  check('切换后不再注册中国站独有模型', !intlModels.includes('deepseek-v4-flash'), JSON.stringify(intlModels));
-
-  // 国家站 key 不该被当成「失效」永久拉黑：RPM 额度随端点调整。
-  const statusBody = await (await fetch(`${origin}/plugins/dsh-sensenova-pool/status`)).json();
-  check('国际站 RPM 额度为 3', statusBody.upstreamEndpoint?.rpmLimit === 3, String(statusBody.upstreamEndpoint?.rpmLimit));
+  check('旧切换动作被拒绝', response.status === 400, String(response.status));
+  await response.json();
+  check('拒绝切换不落盘', written.length === before);
+  const current = await (await fetch(`${origin}/plugins/dsh-sensenova-pool/status`)).json();
+  check('中国站上游保持固定', current.upstreamEndpoint.current === 'cn' && current.upstreamEndpoint.upstream === 'https://token.sensenova.cn/v1');
 }
 
 // 关掉测试自己的 HTTP 服务。
